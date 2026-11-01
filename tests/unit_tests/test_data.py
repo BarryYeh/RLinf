@@ -3610,3 +3610,101 @@ def test_reward_loaders_accept_one_batch_per_rank(tmp_path):
 
     assert len(train_loader) == 1
     assert len(val_loader) == 1
+
+
+def _write_lerobot_v2_dataset(root: Path, episodes: list[tuple[str, int]]) -> None:
+    """Episodes of ``(task, length)``; frame ``t`` is filled with the value ``t``
+    and its action is ``[t, episode_index, 0, ...]``."""
+    import io
+
+    import PIL.Image
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    meta = root / "meta"
+    meta.mkdir(parents=True)
+    info = {
+        "codebase_version": "v2.0",
+        "chunks_size": 1000,
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "features": {
+            "image": {"dtype": "image", "shape": [8, 8, 3]},
+            "actions": {"dtype": "float32", "shape": [7]},
+        },
+    }
+    (meta / "info.json").write_text(json.dumps(info))
+    with (meta / "episodes.jsonl").open("w") as f:
+        for index, (task, length) in enumerate(episodes):
+            f.write(
+                json.dumps({"episode_index": index, "tasks": [task], "length": length})
+                + "\n"
+            )
+            images = []
+            for t in range(length):
+                buffer = io.BytesIO()
+                PIL.Image.fromarray(np.full((8, 8, 3), t, np.uint8)).save(
+                    buffer, format="PNG"
+                )
+                images.append({"bytes": buffer.getvalue(), "path": None})
+            actions = [[float(t), float(index)] + [0.0] * 5 for t in range(length)]
+            path = root / info["data_path"].format(episode_chunk=0, episode_index=index)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(pa.table({"image": images, "actions": actions}), path)
+
+
+def _diffusion_policy_dataset(root, cache_dir, **kwargs):
+    from rlinf.data.datasets.diffusion_policy import LeRobotFrameDataset
+
+    return LeRobotFrameDataset(
+        root=str(root),
+        n_obs_steps=2,
+        obs_stride=3,
+        horizon=4,
+        action_dim=7,
+        cache_dir=str(cache_dir),
+        **kwargs,
+    )
+
+
+def test_diffusion_policy_dataset_strides_frames_and_pads_episode_edges(tmp_path):
+    _write_lerobot_v2_dataset(tmp_path / "data", [("task a", 5), ("task b", 6)])
+    dataset = _diffusion_policy_dataset(tmp_path / "data", tmp_path / "cache")
+    assert len(dataset) == 11
+
+    first = dataset[1]
+    assert first["images"].dtype == torch.uint8
+    assert first["images"].shape == (2, 8, 8, 3)
+    assert first["images"][:, 0, 0, 0].tolist() == [0, 1]
+    assert first["actions"][:, 0].tolist() == [1, 2, 3, 4]
+
+    last_of_first_episode = dataset[4]
+    assert last_of_first_episode["images"][:, 0, 0, 0].tolist() == [1, 4]
+    assert last_of_first_episode["actions"][:, 0].tolist() == [4, 4, 4, 4]
+
+    second_episode = dataset[5 + 3]
+    assert second_episode["images"][:, 0, 0, 0].tolist() == [0, 3]
+    assert second_episode["actions"][:, 1].tolist() == [1, 1, 1, 1]
+
+
+def test_diffusion_policy_dataset_keeps_only_the_requested_tasks(tmp_path):
+    _write_lerobot_v2_dataset(
+        tmp_path / "data", [("Task A", 5), ("task b", 6), ("task  a", 4)]
+    )
+    dataset = _diffusion_policy_dataset(
+        tmp_path / "data", tmp_path / "cache", tasks={"task a"}
+    )
+    assert len(dataset) == 9
+    assert {dataset[i]["actions"][0, 1].item() for i in range(len(dataset))} == {0, 2}
+
+    with pytest.raises(ValueError, match="found none"):
+        _diffusion_policy_dataset(
+            tmp_path / "data", tmp_path / "cache", tasks={"task c"}
+        )
+
+
+def test_diffusion_policy_dataset_survives_pickling_into_loader_workers(tmp_path):
+    _write_lerobot_v2_dataset(tmp_path / "data", [("task a", 5)])
+    dataset = _diffusion_policy_dataset(tmp_path / "data", tmp_path / "cache")
+    dataset[0]
+    restored = pickle.loads(pickle.dumps(dataset))
+    assert torch.equal(restored[2]["images"], dataset[2]["images"])

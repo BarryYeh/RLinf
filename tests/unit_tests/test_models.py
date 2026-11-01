@@ -33,6 +33,7 @@ from rlinf.algorithms.losses import compute_ppo_critic_loss
 from rlinf.config import SupportedModel
 from rlinf.hybrid_engines.fsdp.utils import get_fsdp_wrap_policy
 from rlinf.models import get_model, register_model
+from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.rlt_token_transformer import (
     RLTTokenTransformer,
 )
@@ -1720,3 +1721,131 @@ def test_lingbotvlav2_smoke_config_composes(monkeypatch):
     )
     assert cfg.algorithm.adv_type == "gae" and cfg.algorithm.loss_type == "actor_critic"
     assert cfg.runner.max_steps == 2 and cfg.env.train.total_num_envs == 4
+
+
+def _tiny_diffusion_policy(**overrides):
+    from rlinf.models.embodiment.diffusion_policy.diffusion_policy import (
+        DiffusionPolicy,
+        DiffusionPolicyConfig,
+    )
+
+    cfg = {
+        "action_dim": 7,
+        "num_action_chunks": 4,
+        "horizon": 8,
+        "n_obs_steps": 2,
+        "resize_shape": [96, 96],
+        "crop_shape": [88, 88],
+        "spatial_softmax_num_keypoints": 4,
+        "down_dims": [16, 32],
+        "kernel_size": 3,
+        "n_groups": 4,
+        "diffusion_step_embed_dim": 16,
+        "num_train_timesteps": 10,
+        "num_inference_steps": 5,
+        **overrides,
+    }
+    return DiffusionPolicy(DiffusionPolicyConfig.from_dict(cfg))
+
+
+@pytest.mark.parametrize("num_inference_steps", [1, 4, 10])
+def test_ddpm_scheduler_recovers_x0_from_an_oracle_denoiser(num_inference_steps):
+    from rlinf.models.embodiment.diffusion_policy.scheduler import DDPMScheduler
+
+    scheduler = DDPMScheduler(num_train_timesteps=10)
+    x0 = torch.rand(3, 8, 7) * 1.8 - 0.9
+    sample = torch.randn_like(x0)
+    for t in scheduler.timesteps(num_inference_steps):
+        acp = scheduler.alphas_cumprod[t]
+        eps = (sample - acp.sqrt() * x0) / (1 - acp).sqrt()
+        sample = scheduler.step(eps, t, sample, num_inference_steps)
+    torch.testing.assert_close(sample, x0)
+
+
+def test_diffusion_policy_sft_loss_trains_encoder_and_unet():
+    policy = _tiny_diffusion_policy()
+    batch = {
+        "images": torch.randint(0, 256, (2, 2, 40, 40, 3), dtype=torch.uint8),
+        "actions": torch.rand(2, 8, 7) * 2 - 1,
+    }
+    loss = policy(forward_type=ForwardType.SFT, data=batch)["loss"]
+    loss.backward()
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert policy.encoder.backbone[0].weight.grad is not None
+    assert policy.unet.final_conv[1].weight.grad is not None
+
+
+def test_diffusion_policy_predicts_bounded_action_chunks():
+    policy = _tiny_diffusion_policy(action_min=[-0.5] * 7, action_max=[0.5] * 7).eval()
+    frames = torch.randint(0, 256, (3, 40, 40, 3), dtype=torch.uint8)
+    actions, result = policy.predict_action_batch(env_obs={"main_images": frames})
+    assert actions.shape == (3, 4, 7)
+    assert actions.abs().max() <= 0.5 + 1e-5
+    assert result["forward_inputs"]["action"] is actions
+
+
+def test_diffusion_policy_history_holds_the_previous_chunk_until_an_episode_starts():
+    def second_call_actions(interval):
+        policy = _tiny_diffusion_policy(obs_history_reset_interval=interval).eval()
+        policy.load_state_dict(reference.state_dict())
+        policy.predict_action_batch(env_obs={"main_images": first})
+        torch.manual_seed(0)
+        return policy.predict_action_batch(env_obs={"main_images": second})[0]
+
+    reference = _tiny_diffusion_policy().eval()
+    generator = torch.Generator().manual_seed(1)
+    first, second = torch.randint(
+        0, 256, (2, 2, 40, 40, 3), dtype=torch.uint8, generator=generator
+    )
+    torch.manual_seed(0)
+    fresh = reference.predict_action_batch(env_obs={"main_images": second})[0]
+
+    torch.testing.assert_close(second_call_actions(interval=1), fresh)
+    assert not torch.allclose(second_call_actions(interval=None), fresh)
+
+
+def _diffusion_policy_eval_cfg(**env_overrides):
+    return OmegaConf.create(
+        {
+            "runner": {"task_type": "embodied_eval", "only_eval": True},
+            "env": {
+                "eval": {
+                    "ignore_terminations": True,
+                    "max_episode_steps": 240,
+                    "max_steps_per_rollout_epoch": 240,
+                    **env_overrides,
+                }
+            },
+            "rollout": {
+                "pipeline_stage_num": 1,
+                "model": {"model_type": "diffusion_policy", "num_action_chunks": 8},
+            },
+        }
+    )
+
+
+def test_diffusion_policy_eval_cfg_derives_the_history_reset_interval():
+    from rlinf.config import _validate_diffusion_policy_eval_cfg
+
+    cfg = _diffusion_policy_eval_cfg()
+    _validate_diffusion_policy_eval_cfg(cfg, only_eval=True)
+    assert cfg.rollout.model.obs_history_reset_interval == 30
+
+
+@pytest.mark.parametrize(
+    ("env_overrides", "message"),
+    [
+        ({"ignore_terminations": False}, "ignore_terminations=True"),
+        ({"max_episode_steps": 220, "max_steps_per_rollout_epoch": 220}, "divisible"),
+        ({"max_steps_per_rollout_epoch": 488}, "max_steps_per_rollout_epoch"),
+    ],
+)
+def test_diffusion_policy_eval_cfg_rejects_episodes_off_the_chunk_grid(
+    env_overrides, message
+):
+    from rlinf.config import _validate_diffusion_policy_eval_cfg
+
+    with pytest.raises(ValueError, match=message):
+        _validate_diffusion_policy_eval_cfg(
+            _diffusion_policy_eval_cfg(**env_overrides), only_eval=True
+        )

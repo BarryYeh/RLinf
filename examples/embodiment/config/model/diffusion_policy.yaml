@@ -1,0 +1,32 @@
+# Image-only diffusion policy (LeRobot DiffusionPolicy: ResNet-18 + 1D UNet, DDPM).
+# Inputs are main-camera frames only, matching what the OpenSora world model generates.
+
+model_type: "diffusion_policy"
+model_path: ""
+precision: "fp32"
+is_lora: False
+lora_rank: 32
+
+# LIBERO: 6-DoF delta end-effector + gripper, all in [-1, 1].
+action_dim: 7
+action_min: [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+action_max: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# Actions executed per inference; also the env-step spacing of the frame history.
+num_action_chunks: 8
+horizon: 16
+n_obs_steps: 2
+
+resize_shape: [128, 128]
+crop_shape: [116, 116]
+spatial_softmax_num_keypoints: 32
+
+down_dims: [512, 1024, 2048]
+kernel_size: 5
+n_groups: 8
+diffusion_step_embed_dim: 128
+use_film_scale_modulation: True
+
+num_train_timesteps: 100
+num_inference_steps: 100
+clip_sample_range: 1.0

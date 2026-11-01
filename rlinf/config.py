@@ -108,6 +108,9 @@ SupportedModel.FASTWAM = SupportedModel.register("fastwam", force=True)
 SupportedModel.COSMOS3 = SupportedModel.register("cosmos3", force=True)
 SupportedModel.CNN_POLICY = SupportedModel.register("cnn_policy", force=True)
 SupportedModel.FLOW_POLICY = SupportedModel.register("flow_policy", force=True)
+SupportedModel.DIFFUSION_POLICY = SupportedModel.register(
+    "diffusion_policy", force=True
+)
 SupportedModel.CMA_POLICY = SupportedModel.register("cma", force=True)
 SupportedModel.LINGBOTVLA = SupportedModel.register("lingbotvla", force=True)
 SupportedModel.LINGBOTVLAV2 = SupportedModel.register("lingbotvlav2", force=True)
@@ -154,6 +157,7 @@ EMBODIED_MODEL = set(
         SupportedModel.COSMOS3,
         SupportedModel.CNN_POLICY,
         SupportedModel.FLOW_POLICY,
+        SupportedModel.DIFFUSION_POLICY,
         SupportedModel.CMA_POLICY,
         SupportedModel.LINGBOTVLA,
         SupportedModel.LINGBOTVLAV2,
@@ -1068,6 +1072,56 @@ def validate_online_lerobot_env_cfg(cfg: DictConfig) -> None:
     )
 
 
+def _validate_diffusion_policy_eval_cfg(cfg: DictConfig, only_eval: bool) -> None:
+    """Check the rollout layout the diffusion policy's frame history relies on.
+
+    The policy keeps per-slot frames across rollout calls and starts a new history
+    every ``obs_history_reset_interval`` calls, which is derived here.
+    """
+    if not only_eval:
+        raise ValueError(
+            "model_type 'diffusion_policy' supports evaluation only; train it with "
+            "examples/sft/train_vla_sft.py. Expected runner.only_eval=True or "
+            f"task_type=embodied_eval, got task_type={cfg.runner.task_type!r}."
+        )
+    if cfg.rollout.pipeline_stage_num != 1:
+        raise ValueError(
+            "model_type 'diffusion_policy' keys its frame history by batch index, "
+            "which pipeline stages reuse across environments; expected "
+            f"rollout.pipeline_stage_num=1, got {cfg.rollout.pipeline_stage_num}."
+        )
+    if cfg.runner.get("enable_decoupled_mode", False):
+        raise ValueError(
+            "model_type 'diffusion_policy' keys its frame history by batch index, "
+            "which decoupled mode regroups between calls; expected "
+            "runner.enable_decoupled_mode=False."
+        )
+    eval_cfg = cfg.env.eval
+    if not eval_cfg.ignore_terminations:
+        raise ValueError(
+            "model_type 'diffusion_policy' resets its frame history on a fixed "
+            "episode length, so episodes must not end early; expected "
+            "env.eval.ignore_terminations=True."
+        )
+    num_action_chunks = cfg.rollout.model.num_action_chunks
+    if eval_cfg.max_episode_steps % num_action_chunks != 0:
+        raise ValueError(
+            "Expected env.eval.max_episode_steps divisible by "
+            f"rollout.model.num_action_chunks={num_action_chunks}, got "
+            f"{eval_cfg.max_episode_steps}."
+        )
+    if eval_cfg.max_steps_per_rollout_epoch % eval_cfg.max_episode_steps != 0:
+        raise ValueError(
+            "Expected env.eval.max_steps_per_rollout_epoch divisible by "
+            f"env.eval.max_episode_steps={eval_cfg.max_episode_steps}, got "
+            f"{eval_cfg.max_steps_per_rollout_epoch}."
+        )
+    with open_dict(cfg.rollout.model):
+        cfg.rollout.model.obs_history_reset_interval = (
+            eval_cfg.max_episode_steps // num_action_chunks
+        )
+
+
 def validate_embodied_cfg(cfg):
     only_eval = (
         cfg.runner.get("only_eval", False)
@@ -1243,6 +1297,9 @@ def validate_embodied_cfg(cfg):
             "per-environment action queues by batch index, which pipeline stages "
             "reuse across environments."
         )
+
+    if model_type == SupportedModel.DIFFUSION_POLICY:
+        _validate_diffusion_policy_eval_cfg(cfg, only_eval)
 
     # process num-envs
     component_placement = HybridComponentPlacement(cfg, Cluster())

@@ -119,6 +119,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_diffusion_policy(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.diffusion_policy import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_lingbotvla(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.lingbotvla import get_model
 
@@ -269,6 +274,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.FLOW_POLICY.value,
         _build_flow_policy,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.DIFFUSION_POLICY.value,
+        _build_diffusion_policy,
         category="embodied",
         force=True,
     )

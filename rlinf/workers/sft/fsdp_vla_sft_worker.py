@@ -80,6 +80,14 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_fastwam_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
+        elif model_type == SupportedModel.DIFFUSION_POLICY:
+            from rlinf.data.datasets.diffusion_policy import (
+                build_diffusion_policy_sft_dataloader,
+            )
+
+            return build_diffusion_policy_sft_dataloader(
+                self.cfg, self._world_size, self._rank, data_paths
+            )
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
