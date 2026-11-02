@@ -38,8 +38,9 @@ env:
   group_name: "EnvGroup"
 
   eval:
-    rollout_epoch: 1
-    total_num_envs: 500
+    # 50 envs x 10 epochs covers all 500 LIBERO-Spatial initial states.
+    rollout_epoch: 10
+    total_num_envs: 50
     auto_reset: True
     # The policy's frame history assumes every episode runs to max_episode_steps.
     ignore_terminations: True
