@@ -80,7 +80,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_fastwam_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
-        elif model_type == SupportedModel.DIFFUSION_POLICY:
+        elif model_type in (
+            SupportedModel.DIFFUSION_POLICY,
+            SupportedModel.MULTITASK_DIT,
+        ):
             from rlinf.data.datasets.diffusion_policy import (
                 build_diffusion_policy_sft_dataloader,
             )

@@ -3708,3 +3708,35 @@ def test_diffusion_policy_dataset_survives_pickling_into_loader_workers(tmp_path
     dataset[0]
     restored = pickle.loads(pickle.dumps(dataset))
     assert torch.equal(restored[2]["images"], dataset[2]["images"])
+
+
+def test_diffusion_policy_dataset_returns_the_episode_instruction(tmp_path):
+    _write_lerobot_v2_dataset(tmp_path / "data", [("task a", 5), ("task b", 6)])
+    dataset = _diffusion_policy_dataset(tmp_path / "data", tmp_path / "cache")
+    assert dataset[4]["task"] == "task a"
+    assert dataset[5]["task"] == "task b"
+
+
+def test_diffusion_policy_dataset_subsamples_nested_episodes_per_task(tmp_path):
+    _write_lerobot_v2_dataset(
+        tmp_path / "data",
+        [(task, 3) for task in ("task a", "task b") for _ in range(4)],
+    )
+
+    def kept(episodes_per_task, seed=0):
+        dataset = _diffusion_policy_dataset(
+            tmp_path / "data",
+            tmp_path / "cache",
+            episodes_per_task=episodes_per_task,
+            subsample_seed=seed,
+        )
+        return dataset.episode_indices, dataset.episode_tasks
+
+    one, one_tasks = kept(1)
+    two, two_tasks = kept(2)
+    assert sorted(one_tasks) == ["task a", "task b"]
+    assert sorted(two_tasks) == ["task a", "task a", "task b", "task b"]
+    assert set(one) <= set(two)
+    assert kept(2) == (two, two_tasks)
+    with pytest.raises(ValueError, match="at least 5 episodes"):
+        kept(5)

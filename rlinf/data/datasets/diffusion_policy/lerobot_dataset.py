@@ -49,6 +49,36 @@ def libero_suite_tasks(task_suite_name: str) -> set[str]:
     return {_normalize_task(suite.get_task(i).language) for i in range(suite.n_tasks)}
 
 
+def _subsample_per_task(
+    episodes: list[dict[str, Any]], episodes_per_task: int, seed: int
+) -> list[dict[str, Any]]:
+    """Keep ``episodes_per_task`` episodes of each task in a seeded order.
+
+    Each task's order does not depend on the count, so smaller subsets nest inside
+    larger ones.
+    """
+    by_task: dict[str, list[dict[str, Any]]] = {}
+    for episode in episodes:
+        by_task.setdefault(_normalize_task(episode["tasks"][0]), []).append(episode)
+    rng = np.random.default_rng(seed)
+    kept = []
+    for task in sorted(by_task):
+        task_episodes = sorted(by_task[task], key=lambda ep: int(ep["episode_index"]))
+        if len(task_episodes) < episodes_per_task:
+            raise ValueError(
+                f"Expected at least {episodes_per_task} episodes of task {task!r}, "
+                f"found {len(task_episodes)}."
+            )
+        order = rng.permutation(len(task_episodes))
+        chosen = sorted(order[:episodes_per_task].tolist())
+        kept.extend(task_episodes[i] for i in chosen)
+        logger.info(
+            f"Kept episodes {[int(task_episodes[i]['episode_index']) for i in chosen]} "
+            f"of task {task!r}"
+        )
+    return sorted(kept, key=lambda ep: int(ep["episode_index"]))
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open() as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -66,8 +96,11 @@ class LeRobotFrameDataset(Dataset):
     """Strided frame histories and action horizons from a LeRobot v2.x dataset.
 
     Sample ``t`` of an episode holds the frames at ``t - k * obs_stride`` for
-    ``k = n_obs_steps - 1, ..., 0`` and the actions ``t, ..., t + horizon - 1``;
-    indices outside the episode repeat its first frame or last action. Images
+    ``k = n_obs_steps - 1, ..., 0``, the actions ``t, ..., t + horizon - 1``, and the
+    episode's instruction (``task``); indices outside the episode repeat its first
+    frame or last action. ``episodes_per_task`` keeps that many episodes of each
+    task, chosen by ``subsample_seed``; a smaller count keeps a subset of a larger
+    one. Images
     must be stored in the parquet files (feature dtype ``image``). The selected
     frames are decoded once into a uint8 memmap under ``cache_dir`` so DataLoader
     workers share them through the page cache.
@@ -84,6 +117,8 @@ class LeRobotFrameDataset(Dataset):
         image_key: str = "image",
         action_key: str = "actions",
         tasks: Optional[set[str]] = None,
+        episodes_per_task: Optional[int] = None,
+        subsample_seed: int = 0,
     ):
         self.root = Path(root).expanduser().resolve()
         self.n_obs_steps = n_obs_steps
@@ -126,6 +161,10 @@ class LeRobotFrameDataset(Dataset):
                 f"Expected episodes in {self.root} matching tasks "
                 f"{sorted(tasks) if tasks is not None else 'any'}, found none."
             )
+        if episodes_per_task is not None:
+            episodes = _subsample_per_task(episodes, episodes_per_task, subsample_seed)
+        self.episode_indices = [int(ep["episode_index"]) for ep in episodes]
+        self.episode_tasks = [ep["tasks"][0] for ep in episodes]
         self.parquet_paths = [self._parquet_path(info, ep) for ep in episodes]
         self.lengths = np.asarray([int(ep["length"]) for ep in episodes])
         self.starts = np.concatenate([[0], np.cumsum(self.lengths)[:-1]])
@@ -230,6 +269,7 @@ class LeRobotFrameDataset(Dataset):
         return {
             "images": torch.from_numpy(self._frames[[start + i for i in obs_t]]),
             "actions": torch.from_numpy(self.actions[[start + i for i in action_t]]),
+            "task": self.episode_tasks[episode],
         }
 
 
@@ -251,6 +291,8 @@ def build_diffusion_policy_datasets(
             image_key=data_cfg.get("image_key", "image"),
             action_key=data_cfg.get("action_key", "actions"),
             tasks=tasks,
+            episodes_per_task=data_cfg.get("episodes_per_task", None),
+            subsample_seed=data_cfg.get("subsample_seed", 0),
         )
         for path in paths
     ]

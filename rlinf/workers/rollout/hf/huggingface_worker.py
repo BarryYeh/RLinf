@@ -523,6 +523,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
             SupportedModel.DIFFUSION_POLICY,
+            SupportedModel.MULTITASK_DIT,
             SupportedModel.CFG_MODEL,
             SupportedModel.MOLMOACT2,
             SupportedModel.LINGBOTVLAV2,

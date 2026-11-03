@@ -1849,3 +1849,158 @@ def test_diffusion_policy_eval_cfg_rejects_episodes_off_the_chunk_grid(
         _validate_diffusion_policy_eval_cfg(
             _diffusion_policy_eval_cfg(**env_overrides), only_eval=True
         )
+
+
+class _WordTokenizer:
+    """Stands in for the CLIP tokenizer: one id per word, then the EOS id."""
+
+    def __init__(self, eos_token_id: int):
+        self.eos_token_id = eos_token_id
+
+    def __call__(self, texts, **kwargs):
+        from transformers import BatchEncoding
+
+        ids = [
+            [hash(word) % (self.eos_token_id - 1) + 1 for word in text.split()]
+            + [self.eos_token_id]
+            for text in texts
+        ]
+        length = max(len(row) for row in ids)
+        return BatchEncoding(
+            {
+                "input_ids": torch.tensor(
+                    [row + [0] * (length - len(row)) for row in ids]
+                ),
+                "attention_mask": torch.tensor(
+                    [[1] * len(row) + [0] * (length - len(row)) for row in ids]
+                ),
+            }
+        )
+
+
+def _tiny_multitask_dit(monkeypatch, **overrides):
+    """A small Multitask DiT whose CLIP encoders are built locally, not downloaded."""
+    from transformers import (
+        CLIPTextConfig,
+        CLIPTextModel,
+        CLIPVisionConfig,
+        CLIPVisionModel,
+    )
+
+    from rlinf.models.embodiment.multitask_dit import modules
+    from rlinf.models.embodiment.multitask_dit.multitask_dit import (
+        MultitaskDiTConfig,
+        MultitaskDiTPolicy,
+    )
+
+    def load_tiny_clip(vision_name, text_name):
+        torch.manual_seed(0)
+        vision = CLIPVisionModel(
+            CLIPVisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=32,
+                patch_size=16,
+            )
+        )
+        text = CLIPTextModel(
+            CLIPTextConfig(
+                vocab_size=100,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                max_position_embeddings=32,
+                eos_token_id=99,
+            )
+        )
+        return vision, text, _WordTokenizer(eos_token_id=99)
+
+    monkeypatch.setattr(modules, "load_clip_encoders", load_tiny_clip)
+    cfg = {
+        "action_dim": 7,
+        "num_action_chunks": 4,
+        "horizon": 8,
+        "n_obs_steps": 2,
+        "crop_shape": [32, 32],
+        "hidden_dim": 32,
+        "num_layers": 2,
+        "num_heads": 2,
+        "timestep_embed_dim": 16,
+        "num_train_timesteps": 10,
+        "num_inference_steps": 5,
+        **overrides,
+    }
+    return MultitaskDiTPolicy(MultitaskDiTConfig.from_dict(cfg))
+
+
+def test_multitask_dit_sft_trains_vision_projection_and_dit_but_not_text_encoder(
+    monkeypatch,
+):
+    policy = _tiny_multitask_dit(monkeypatch)
+    batch = {
+        "images": torch.randint(0, 256, (2, 2, 40, 40, 3), dtype=torch.uint8),
+        "actions": torch.rand(2, 8, 7) * 2 - 1,
+        "task": ["pick up the bowl", "open the drawer"],
+    }
+    loss = policy(forward_type=ForwardType.SFT, data=batch)["loss"]
+    loss.backward()
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert (
+        policy.vision_encoder.vision_model.embeddings.patch_embedding.weight.grad
+        is not None
+    )
+    assert policy.text_proj.weight.grad is not None
+    assert policy.dit.blocks[0].adaln[-1].weight.grad is not None
+    assert all(p.grad is None for p in policy.text_encoder.parameters())
+
+
+def test_multitask_dit_lr_multiplier_selects_exactly_the_vision_encoder(monkeypatch):
+    policy = _tiny_multitask_dit(monkeypatch)
+    ((pattern, multiplier),) = policy.lr_multipliers.items()
+    matched = {name for name, _ in policy.named_parameters() if pattern in name}
+    vision = {
+        f"vision_encoder.{name}" for name, _ in policy.vision_encoder.named_parameters()
+    }
+    assert matched == vision and multiplier == 0.1
+
+
+def test_multitask_dit_actions_follow_the_instruction(monkeypatch):
+    policy = _tiny_multitask_dit(monkeypatch).eval()
+    # AdaLN-Zero starts every block as the identity, which ignores the condition.
+    for block in policy.dit.blocks:
+        torch.nn.init.normal_(block.adaln[-1].weight, std=0.5)
+    frames = torch.randint(0, 256, (1, 40, 40, 3), dtype=torch.uint8).repeat(2, 1, 1, 1)
+
+    def actions(tasks):
+        policy.reset()
+        torch.manual_seed(0)
+        obs = {"main_images": frames, "task_descriptions": tasks}
+        return policy.predict_action_batch(env_obs=obs)[0]
+
+    # Same seed, so each row draws the same noise in both calls.
+    reference = actions(["pick up the bowl", "pick up the bowl"])
+    changed = actions(["pick up the bowl", "open the drawer"])
+    torch.testing.assert_close(changed[0], reference[0])
+    assert not torch.allclose(changed[1], reference[1])
+
+
+def test_multitask_dit_predicts_chunks_within_the_action_bounds(monkeypatch):
+    policy = _tiny_multitask_dit(
+        monkeypatch, action_min=[-0.5] * 7, action_max=[0.25] * 7
+    ).eval()
+    obs = {
+        "main_images": torch.randint(0, 256, (3, 40, 40, 3), dtype=torch.uint8),
+        "task_descriptions": ["a", "b", "c"],
+    }
+    actions, result = policy.predict_action_batch(env_obs=obs)
+    assert actions.shape == (3, 4, 7)
+    assert actions.min() >= -0.5 - 1e-5 and actions.max() <= 0.25 + 1e-5
+    assert result["forward_inputs"]["action"] is actions
+
+
+def test_multitask_dit_rejects_a_crop_the_vision_encoder_cannot_take(monkeypatch):
+    with pytest.raises(ValueError, match="input size"):
+        _tiny_multitask_dit(monkeypatch, crop_shape=[24, 24])

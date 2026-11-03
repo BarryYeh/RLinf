@@ -124,6 +124,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_multitask_dit(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.multitask_dit import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_lingbotvla(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.lingbotvla import get_model
 
@@ -280,6 +285,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.DIFFUSION_POLICY.value,
         _build_diffusion_policy,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.MULTITASK_DIT.value,
+        _build_multitask_dit,
         category="embodied",
         force=True,
     )

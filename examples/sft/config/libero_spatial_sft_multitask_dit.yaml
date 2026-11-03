@@ -1,0 +1,81 @@
+# Multitask DiT SFT on the LIBERO-Spatial episodes of physical-intelligence/libero.
+#
+# Launch: bash examples/sft/run_vla_sft.sh libero_spatial_sft_multitask_dit
+# Data:   hf download physical-intelligence/libero --repo-type dataset --local-dir /path/to/libero
+# The CLIP encoders download from the Hugging Face Hub on first use.
+# Evaluate <log_path>/<experiment_name>/checkpoints/global_step_<N>/actor/model_state_dict/full_weights.pt
+# with evaluations/libero/libero_spatial_multitask_dit_eval.yaml.
+
+defaults:
+  - model/multitask_dit@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+    - file://${oc.env:REPO_PATH}/examples/embodiment/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf-multitask-dit
+    experiment_name: "libero_spatial_sft_multitask_dit"
+    logger_backends: ["wandb", "tensorboard"]
+
+  max_epochs: -1
+  max_steps: 30000
+  val_check_interval: -1
+  save_interval: 10000
+
+data:
+  train_data_paths: "/path/to/libero" # https://huggingface.co/datasets/physical-intelligence/libero
+  task_suite_name: libero_spatial
+  image_key: "image"
+  action_key: "actions"
+  # Episodes kept per task (null keeps all), chosen by subsample_seed; smaller
+  # counts keep a subset of larger ones.
+  episodes_per_task: null
+  subsample_seed: 0
+  # Decoded main-camera frames (about 10 GB for all LIBERO-Spatial episodes at 256x256).
+  cache_dir: "/path/to/cache/diffusion_policy"
+  num_workers: 8
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 256
+  global_batch_size: 256
+  seed: 1000
+
+  # LeRobot's LIBERO recipe: Adam, lr 3e-4 with cosine decay, no warmup or decay;
+  # the CLIP vision encoder trains at vision_encoder_lr_multiplier times lr.
+  optim:
+    lr: 3.0e-4
+    adam_beta1: 0.95
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.0
+    clip_grad: 10.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 0
+    total_training_steps: 30000
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    # The frozen CLIP text encoder shares a flat parameter with trained weights.
+    use_orig_params: True
+    gradient_checkpointing: False
+    amp_autocast:
+      enabled: True
+      precision: "bf16"

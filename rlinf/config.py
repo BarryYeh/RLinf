@@ -111,6 +111,7 @@ SupportedModel.FLOW_POLICY = SupportedModel.register("flow_policy", force=True)
 SupportedModel.DIFFUSION_POLICY = SupportedModel.register(
     "diffusion_policy", force=True
 )
+SupportedModel.MULTITASK_DIT = SupportedModel.register("multitask_dit", force=True)
 SupportedModel.CMA_POLICY = SupportedModel.register("cma", force=True)
 SupportedModel.LINGBOTVLA = SupportedModel.register("lingbotvla", force=True)
 SupportedModel.LINGBOTVLAV2 = SupportedModel.register("lingbotvlav2", force=True)
@@ -158,6 +159,7 @@ EMBODIED_MODEL = set(
         SupportedModel.CNN_POLICY,
         SupportedModel.FLOW_POLICY,
         SupportedModel.DIFFUSION_POLICY,
+        SupportedModel.MULTITASK_DIT,
         SupportedModel.CMA_POLICY,
         SupportedModel.LINGBOTVLA,
         SupportedModel.LINGBOTVLAV2,
@@ -1073,33 +1075,35 @@ def validate_online_lerobot_env_cfg(cfg: DictConfig) -> None:
 
 
 def _validate_diffusion_policy_eval_cfg(cfg: DictConfig, only_eval: bool) -> None:
-    """Check the rollout layout the diffusion policy's frame history relies on.
+    """Check the rollout layout a frame-history policy relies on.
 
-    The policy keeps per-slot frames across rollout calls and starts a new history
-    every ``obs_history_reset_interval`` calls, which is derived here.
+    ``diffusion_policy`` and ``multitask_dit`` keep per-slot frames across rollout
+    calls and start a new history every ``obs_history_reset_interval`` calls, which
+    is derived here.
     """
+    model_type = cfg.rollout.model.model_type
     if not only_eval:
         raise ValueError(
-            "model_type 'diffusion_policy' supports evaluation only; train it with "
+            f"model_type {model_type!r} supports evaluation only; train it with "
             "examples/sft/train_vla_sft.py. Expected runner.only_eval=True or "
             f"task_type=embodied_eval, got task_type={cfg.runner.task_type!r}."
         )
     if cfg.rollout.pipeline_stage_num != 1:
         raise ValueError(
-            "model_type 'diffusion_policy' keys its frame history by batch index, "
+            f"model_type {model_type!r} keys its frame history by batch index, "
             "which pipeline stages reuse across environments; expected "
             f"rollout.pipeline_stage_num=1, got {cfg.rollout.pipeline_stage_num}."
         )
     if cfg.runner.get("enable_decoupled_mode", False):
         raise ValueError(
-            "model_type 'diffusion_policy' keys its frame history by batch index, "
+            f"model_type {model_type!r} keys its frame history by batch index, "
             "which decoupled mode regroups between calls; expected "
             "runner.enable_decoupled_mode=False."
         )
     eval_cfg = cfg.env.eval
     if not eval_cfg.ignore_terminations:
         raise ValueError(
-            "model_type 'diffusion_policy' resets its frame history on a fixed "
+            f"model_type {model_type!r} resets its frame history on a fixed "
             "episode length, so episodes must not end early; expected "
             "env.eval.ignore_terminations=True."
         )
@@ -1298,7 +1302,7 @@ def validate_embodied_cfg(cfg):
             "reuse across environments."
         )
 
-    if model_type == SupportedModel.DIFFUSION_POLICY:
+    if model_type in (SupportedModel.DIFFUSION_POLICY, SupportedModel.MULTITASK_DIT):
         _validate_diffusion_policy_eval_cfg(cfg, only_eval)
 
     # process num-envs

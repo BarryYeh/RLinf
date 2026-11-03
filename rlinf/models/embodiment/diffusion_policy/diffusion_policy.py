@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.diffusion_policy.frame_history import FrameHistory
 from rlinf.models.embodiment.diffusion_policy.modules import (
     ConditionalUnet1d,
     RgbEncoder,
@@ -136,8 +137,7 @@ class DiffusionPolicy(nn.Module, BasePolicy):
         self.register_buffer(
             "image_std", torch.tensor(_IMAGENET_STD).view(1, 3, 1, 1), persistent=False
         )
-        self._obs_history: Optional[torch.Tensor] = None
-        self._num_rollout_calls = 0
+        self._history = FrameHistory(cfg.n_obs_steps, cfg.obs_history_reset_interval)
 
     @property
     def num_action_chunks(self) -> int:
@@ -229,25 +229,7 @@ class DiffusionPolicy(nn.Module, BasePolicy):
 
     def reset(self) -> None:
         """Forget the frame history of every batch slot."""
-        self._obs_history = None
-        self._num_rollout_calls = 0
-
-    def _update_obs_history(self, frames: torch.Tensor) -> torch.Tensor:
-        interval = self.cfg.obs_history_reset_interval
-        if (
-            self._obs_history is None
-            or self._obs_history.shape[0] != frames.shape[0]
-            or (interval is not None and self._num_rollout_calls % interval == 0)
-        ):
-            self._obs_history = frames.unsqueeze(1).repeat(
-                1, self.cfg.n_obs_steps, 1, 1, 1
-            )
-        else:
-            self._obs_history = torch.cat(
-                [self._obs_history[:, 1:], frames.unsqueeze(1)], dim=1
-            )
-        self._num_rollout_calls += 1
-        return self._obs_history
+        self._history.reset()
 
     def predict_action_batch(
         self, env_obs: dict[str, Any], mode: str = "eval", **kwargs
@@ -265,7 +247,7 @@ class DiffusionPolicy(nn.Module, BasePolicy):
             raise NotImplementedError(
                 f"DiffusionPolicy rollout supports mode='eval' only, got {mode!r}."
             )
-        images = self._update_obs_history(torch.as_tensor(env_obs["main_images"]))
+        images = self._history.update(torch.as_tensor(env_obs["main_images"]))
         actions = self.sample_actions(images)[:, : self.cfg.num_action_chunks]
         actions = actions.cpu()
         placeholder = torch.zeros(actions.shape[:2])
