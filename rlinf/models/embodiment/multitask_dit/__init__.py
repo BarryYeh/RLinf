@@ -17,6 +17,7 @@ from omegaconf import DictConfig, OmegaConf
 
 
 def get_model(cfg: DictConfig, torch_dtype=torch.float32):
+    """Build the policy; a non-empty ``model_path`` is a ``full_weights.pt`` to load."""
     from rlinf.models.embodiment.multitask_dit.multitask_dit import (
         MultitaskDiTConfig,
         MultitaskDiTPolicy,
@@ -25,4 +26,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.float32):
     model_config = MultitaskDiTConfig.from_dict(
         OmegaConf.to_container(cfg, resolve=True)
     )
-    return MultitaskDiTPolicy(model_config).to(torch_dtype)
+    model = MultitaskDiTPolicy(model_config)
+    if cfg.get("model_path"):
+        model.load_state_dict(torch.load(cfg.model_path, map_location="cpu"))
+    return model.to(torch_dtype)
