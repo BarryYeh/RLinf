@@ -55,8 +55,9 @@ Ask the project owner before changing any of these.
   Train on 40 states per task and evaluate on the other 10.
   Store the split in config and never imagine from evaluation states.
 - **Evaluation.** Report SR on the 100 held-out states, with K reruns per state.
-- **Filtering.** An absolute success floor from both reward models, then within-group top-k.
+- **Filtering.** An absolute success floor, then within-group top-k.
   Never rank alone, because the best of an all-failure group is still a failure.
+  The floor needs both reward models, except in iteration 1, where Robometer alone judges (see below).
 - **Training frames.** The policy trains on imagined frames and has no real-frame replay arm.
 
 ## Constraints in the current code
@@ -69,6 +70,29 @@ Ask the project owner before changing any of these.
   Score rollouts after they finish, instead of using the WM's built-in `ResnetRM` termination.
 - **Frame convention.** The WM's training frames must match the orientation and crop of the LIBERO frames the policy was trained on.
   Check this before WM fine-tuning.
+
+## Iteration 1: Robometer judge, stock world model (2026-11-05)
+
+Iteration 1 skips WM and reward-model fine-tuning.
+The base policy is the Multitask DiT trained on 10 demos per task for 30k steps (ep10 @ 30k), and the WM is the stock OpenSora LIBERO-Spatial checkpoint.
+
+- **Judge.** `robometer_judge.py` scores each episode in one Robometer query over 31 frames (steps 0, 8, …, 240).
+  An episode succeeds when 3 scored frames in a row have a success probability above 0.5, and `success_step` is the first frame of that window.
+  On the 400 real training episodes of trials 0–9 (4 reruns), it agrees with the simulator on 86% (recall 97%, precision 86%); most false positives are on task 3 (judge 57.5% vs simulator 22.5%).
+- **Tasks.** Tasks whose imagined SR (this judge on closed-loop WM rollouts) differs from the real simulator SR by at least 30 points on trials 0–9:
+
+  | Task | Real SR (sim) | Imagined SR (judge) | Gap |
+  |---|---|---|---|
+  | 1, bowl next to the ramekin | 72.5% | 15.0% | −57.5 |
+  | 3, bowl on the cookie box | 22.5% | 87.5% | +65.0 |
+  | 9, bowl on the wooden cabinet | 65.0% | 100.0% | +35.0 |
+
+- **Imagination.** `imagine_rollouts.py --tasks 1,3,9 --trials 0-39 --reruns 8`: 8 closed-loop rollouts from each training state of those tasks.
+- **Filtering.** Of each state's judged successes, `export_imagined.py` keeps the 4 with the highest mean success probability, each cut at `success_step`, as a LeRobot dataset.
+- **Policy update.** Two arms fine-tune ep10 @ 30k for 10k steps (lr 1e-4 cosine, 500 warmup steps, batch 256): the 10 demos per task alone, and those demos with the kept rollouts at 50/50 per batch (`data.sampling_weights`).
+- **Evaluation.** Base and both arms on held-out trials 40–49: tasks 1, 3, 9 with 8 reruns, and all tasks with 2 reruns.
+
+Outputs are under `~/datastorage/runs/imagination/iter1/`, and the calibration is in `~/datastorage/runs/imagination/robometer_fidelity/judge_calibration.json`.
 
 ## Results: base policy and Robometer (2026-11-02)
 

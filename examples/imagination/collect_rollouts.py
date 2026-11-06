@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         default="40-49",
         help="Trial ids per task, as 'a-b' (inclusive) or a comma list.",
     )
+    parser.add_argument(
+        "--tasks",
+        default=None,
+        help="Task ids, as 'a-b' (inclusive) or a comma list; default: every task.",
+    )
     parser.add_argument("--reruns", type=int, default=1, help="Rollouts per state.")
     parser.add_argument("--num-envs", type=int, default=50)
     parser.add_argument("--max-episode-steps", type=int, default=240)
@@ -128,16 +133,17 @@ def main() -> None:
 
     trials = parse_trials(args.trials)
     bins = np.asarray(env.trial_id_bins)
+    tasks = parse_trials(args.tasks) if args.tasks else list(range(len(bins)))
     starts = np.concatenate([[0], np.cumsum(bins)[:-1]])
     jobs = [
         (int(starts[task] + trial), task, trial, rerun)
         for rerun in range(args.reruns)
         for trial in trials
-        for task in range(len(bins))
+        for task in tasks
         if trial < bins[task]
     ]
     logger.info(
-        f"{len(jobs)} episodes: {len(bins)} tasks x trials {trials} x "
+        f"{len(jobs)} episodes: tasks {tasks} x trials {trials} x "
         f"{args.reruns} reruns, {args.num_envs} envs per batch"
     )
 
