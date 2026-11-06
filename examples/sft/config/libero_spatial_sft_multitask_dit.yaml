@@ -43,9 +43,12 @@ data:
   image_key: "image"
   action_key: "actions"
   # Episodes kept per task (null keeps all), chosen by subsample_seed; smaller
-  # counts keep a subset of larger ones.
+  # counts keep a subset of larger ones. A list gives one count per train_data_paths entry.
   episodes_per_task: null
   subsample_seed: 0
+  # One weight per train_data_paths entry: each path fills that share of the samples.
+  # null samples every frame equally.
+  sampling_weights: null
   # Decoded main-camera frames (about 10 GB for all LIBERO-Spatial episodes at 256x256).
   cache_dir: "/path/to/cache/diffusion_policy"
   num_workers: 8

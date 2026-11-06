@@ -276,10 +276,23 @@ class LeRobotFrameDataset(Dataset):
 def build_diffusion_policy_datasets(
     data_paths: str | Sequence[str], model_cfg: Any, data_cfg: Any
 ) -> list[LeRobotFrameDataset]:
-    """One dataset per path, sampled with the model's history and horizon."""
+    """One dataset per path, sampled with the model's history and horizon.
+
+    ``data_cfg.episodes_per_task`` is one count (or null) for every path, or a list
+    with one entry per path.
+    """
     paths = [data_paths] if isinstance(data_paths, str) else list(data_paths)
     task_suite_name = data_cfg.get("task_suite_name", None)
     tasks = libero_suite_tasks(task_suite_name) if task_suite_name else None
+    episodes_per_task = data_cfg.get("episodes_per_task", None)
+    if isinstance(episodes_per_task, Sequence):
+        if len(episodes_per_task) != len(paths):
+            raise ValueError(
+                f"Expected one episodes_per_task entry per path ({len(paths)}), got "
+                f"{len(episodes_per_task)}."
+            )
+    else:
+        episodes_per_task = [episodes_per_task] * len(paths)
     return [
         LeRobotFrameDataset(
             root=path,
@@ -291,8 +304,8 @@ def build_diffusion_policy_datasets(
             image_key=data_cfg.get("image_key", "image"),
             action_key=data_cfg.get("action_key", "actions"),
             tasks=tasks,
-            episodes_per_task=data_cfg.get("episodes_per_task", None),
+            episodes_per_task=count,
             subsample_seed=data_cfg.get("subsample_seed", 0),
         )
-        for path in paths
+        for path, count in zip(paths, episodes_per_task)
     ]
