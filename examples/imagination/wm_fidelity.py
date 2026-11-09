@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare world-model rollouts from ``imagine_rollouts.py`` with the real LIBERO rollouts.
+"""Compare world-model rollouts from ``imagine_rollouts.py`` with real LIBERO rollouts.
 
-``--policy`` (closed loop) is compared per state: the imagined success rate against
-the real one, as Pearson and Spearman correlation, mean absolute error, and MMRV
-(mean maximum rank violation). ``--replay`` (open loop on the real actions) is
-compared per episode: the reward model's success call on generated frames and on
-the real frames against the simulator, and the PSNR of generated frames against the
-real ones over time. Success means success at any step. Writes ``--out`` as JSON.
+Every success call on world-model frames is the Robometer judge's
+(``robometer_judge.jsonl`` in the world-model run); success means success at any
+step.
+
+``--policy`` (closed loop) is compared per state: the judged imagined success rate
+against the simulator's real one, as Pearson and Spearman correlation, mean absolute
+error, and MMRV (mean maximum rank violation). ``--replay`` (open loop on the real
+actions) is compared per episode, with the judge also run on ``--real``: a replay
+disagrees when the judge's calls on the real and the replayed frames differ, a fake
+success when only the replay passes and a missed success when only the real one
+does. It also reports the PSNR of replayed frames against the real ones over time.
+Writes ``--out`` as JSON.
 """
 
 import argparse
@@ -28,6 +34,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from common import load_records
 
 from rlinf.utils.logging import get_logger
 
@@ -44,8 +51,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def episodes(run: Path) -> list[dict]:
-    return json.loads((run / "summary.json").read_text())["episodes_list"]
+def judge_rows(run: Path) -> dict[str, dict]:
+    path = run / "robometer_judge.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"Expected robometer_judge.py output {path}.")
+    rows = (json.loads(line) for line in open(path))
+    return {row["episode"]: row for row in rows}
 
 
 def ranks(x: np.ndarray) -> np.ndarray:
@@ -72,61 +83,40 @@ def mmrv(real: np.ndarray, imagined: np.ndarray) -> float:
     return float(gaps.max(axis=1).mean())
 
 
-def auroc(scores: np.ndarray, labels: np.ndarray) -> float:
-    pos, neg = scores[labels], scores[~labels]
-    if len(pos) == 0 or len(neg) == 0:
-        return float("nan")
-    return float(
-        (pos[:, None] > neg[None, :]).mean()
-        + 0.5 * (pos[:, None] == neg[None, :]).mean()
-    )
-
-
-def confusion(pred: np.ndarray, label: np.ndarray) -> dict:
-    return {
-        "accuracy": float((pred == label).mean()),
-        "true_positive": int((pred & label).sum()),
-        "false_positive": int((pred & ~label).sum()),
-        "false_negative": int((~pred & label).sum()),
-        "true_negative": int((~pred & ~label).sum()),
-    }
-
-
-def per_state_rates(rows: list[dict]) -> dict[int, float]:
+def per_state_rates(rows) -> dict[int, float]:
     by_state = defaultdict(list)
     for r in rows:
         by_state[r["state_id"]].append(r["success"])
     return {s: float(np.mean(v)) for s, v in by_state.items()}
 
 
-def closed_loop(real_rows: list[dict], imagined_rows: list[dict]) -> dict:
-    real_rate, imagined_rate = (
-        per_state_rates(real_rows),
-        per_state_rates(imagined_rows),
-    )
+def closed_loop(real: Path, policy: Path) -> dict:
+    real_rows = load_records(real)
+    real_rate = per_state_rates(real_rows)
+    imagined_rate = per_state_rates(judge_rows(policy).values())
     states = sorted(set(real_rate) & set(imagined_rate))
-    real = np.array([real_rate[s] for s in states])
-    imagined = np.array([imagined_rate[s] for s in states])
+    real_sr = np.array([real_rate[s] for s in states])
+    imagined_sr = np.array([imagined_rate[s] for s in states])
     task_of = {r["state_id"]: r["task_id"] for r in real_rows}
     per_task = {}
     for task in sorted({task_of[s] for s in states}):
         sel = np.array([task_of[s] == task for s in states])
         per_task[task] = {
             "states": int(sel.sum()),
-            "real_success_rate": float(real[sel].mean()),
-            "imagined_success_rate": float(imagined[sel].mean()),
-            "pearson_states": pearson(real[sel], imagined[sel]),
+            "real_success_rate": float(real_sr[sel].mean()),
+            "imagined_success_rate": float(imagined_sr[sel].mean()),
+            "pearson_states": pearson(real_sr[sel], imagined_sr[sel]),
         }
     task_real = np.array([v["real_success_rate"] for v in per_task.values()])
     task_imagined = np.array([v["imagined_success_rate"] for v in per_task.values()])
     return {
         "states": len(states),
-        "real_success_rate": float(real.mean()),
-        "imagined_success_rate": float(imagined.mean()),
-        "pearson_states": pearson(real, imagined),
-        "spearman_states": pearson(ranks(real), ranks(imagined)),
-        "mae_states": float(np.abs(real - imagined).mean()),
-        "mmrv_states": mmrv(real, imagined),
+        "real_success_rate": float(real_sr.mean()),
+        "imagined_success_rate": float(imagined_sr.mean()),
+        "pearson_states": pearson(real_sr, imagined_sr),
+        "spearman_states": pearson(ranks(real_sr), ranks(imagined_sr)),
+        "mae_states": float(np.abs(real_sr - imagined_sr).mean()),
+        "mmrv_states": mmrv(real_sr, imagined_sr),
         "pearson_tasks": pearson(task_real, task_imagined),
         "mmrv_tasks": mmrv(task_real, task_imagined),
         "per_task": per_task,
@@ -139,32 +129,43 @@ def psnr(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return 10 * np.log10(255.0**2 / np.maximum(mse, 1e-10))
 
 
-def open_loop(real: Path, replay: Path, psnr_steps: list[int]) -> dict:
-    sim, wm_call, real_call, wm_max, real_max, curves = [], [], [], [], [], []
-    for r in episodes(replay):
-        name = f"state_{r['state_id']:03d}_rerun_{r['rerun']}.npz"
-        imagined = np.load(replay / "episodes" / name)
-        real_ep = np.load(real / "episodes" / name)
-        threshold_calls = imagined["step_success"]
-        sim.append(bool(real_ep["success"]))
-        wm_call.append(bool(threshold_calls.any()))
-        wm_max.append(float(imagined["rm_reward"].max()))
-        real_max.append(float(imagined["rm_reward_real"].max()))
-        curves.append(psnr(imagined["frames"], real_ep["frames"]))
-    sim, wm_call = np.array(sim), np.array(wm_call)
-    wm_max, real_max = np.array(wm_max), np.array(real_max)
-    threshold = json.loads((replay / "summary.json").read_text())["success_threshold"]
-    real_call = real_max >= threshold
-    curves = np.stack(curves)
+def disagreement(sim: np.ndarray, real: np.ndarray, replay: np.ndarray) -> dict:
     return {
         "episodes": len(sim),
         "sim_success_rate": float(sim.mean()),
-        "wm_success_rate": float(wm_call.mean()),
-        "rm_on_real_frames_success_rate": float(real_call.mean()),
-        "wm_vs_sim": confusion(wm_call, sim),
-        "rm_on_real_frames_vs_sim": confusion(real_call, sim),
-        "auroc_wm_max_reward": auroc(wm_max, sim),
-        "auroc_real_frames_max_reward": auroc(real_max, sim),
+        "real_judge_success_rate": float(real.mean()),
+        "replay_judge_success_rate": float(replay.mean()),
+        "disagreement": float((real != replay).mean()),
+        "fake_success": float((replay & ~real).mean()),
+        "missed_success": float((~replay & real).mean()),
+    }
+
+
+def open_loop(real: Path, replay: Path, psnr_steps: list[int]) -> dict:
+    real_judge, replay_judge = judge_rows(real), judge_rows(replay)
+    names = sorted(replay_judge)
+    task, sim, curves = [], [], []
+    for name in names:
+        with (
+            np.load(replay / "episodes" / f"{name}.npz") as replayed,
+            np.load(real / "episodes" / f"{name}.npz") as real_ep,
+        ):
+            anchor = int(replayed["anchor_step"]) if "anchor_step" in replayed else 0
+            task.append(int(real_ep["task_id"]))
+            sim.append(bool(real_ep["success"]))
+            curves.append(psnr(replayed["frames"], real_ep["frames"][anchor:]))
+    task, sim = np.array(task), np.array(sim)
+    real_call = np.array([real_judge[n]["success"] for n in names])
+    replay_call = np.array([replay_judge[n]["success"] for n in names])
+    curves = np.stack(curves)
+    return {
+        **disagreement(sim, real_call, replay_call),
+        "per_task": {
+            int(t): disagreement(
+                sim[task == t], real_call[task == t], replay_call[task == t]
+            )
+            for t in np.unique(task)
+        },
         "psnr_by_step": {
             s: float(curves[:, s].mean()) for s in psnr_steps if s < curves.shape[1]
         },
@@ -176,7 +177,7 @@ def main() -> None:
     real = Path(args.real)
     report = {"real": str(real)}
     if args.policy:
-        report["closed_loop"] = closed_loop(episodes(real), episodes(Path(args.policy)))
+        report["closed_loop"] = closed_loop(real, Path(args.policy))
     if args.replay:
         steps = [int(x) for x in args.psnr_steps.split(",")]
         report["open_loop"] = open_loop(real, Path(args.replay), steps)

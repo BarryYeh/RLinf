@@ -29,13 +29,13 @@ with ``True``; ``--ignore-terminations`` sets the env flag itself.
 """
 
 import argparse
-import json
 import os
 from pathlib import Path
 
 import imageio
 import numpy as np
 import torch
+from common import load_policy, parse_ids, save_episode, write_summary
 from omegaconf import OmegaConf
 
 from rlinf.utils.logging import get_logger
@@ -58,15 +58,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True, help="Output directory.")
     parser.add_argument(
         "--trials",
-        default="40-49",
-        help="Trial ids per task, as 'a-b' (inclusive) or a comma list.",
+        default=None,
+        help="Trial ids per task, as 'a-b' (inclusive) or a comma list; "
+        "default: every state.",
+    )
+    parser.add_argument(
+        "--init-states-dir",
+        default=None,
+        help="A split directory written by sample_init_states.py; "
+        "default: the benchmark (test) states.",
     )
     parser.add_argument(
         "--tasks",
         default=None,
         help="Task ids, as 'a-b' (inclusive) or a comma list; default: every task.",
     )
-    parser.add_argument("--reruns", type=int, default=1, help="Rollouts per state.")
+    parser.add_argument(
+        "--reruns",
+        type=int,
+        default=2,
+        help="Rollouts per state; test evaluation uses 2.",
+    )
     parser.add_argument("--num-envs", type=int, default=50)
     parser.add_argument("--max-episode-steps", type=int, default=240)
     parser.add_argument("--seed", type=int, default=0)
@@ -74,13 +86,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--videos-per-task", type=int, default=0)
     parser.add_argument("--video-fps", type=int, default=20)
     return parser.parse_args()
-
-
-def parse_trials(spec: str) -> list[int]:
-    if "-" in spec:
-        start, end = (int(x) for x in spec.split("-"))
-        return list(range(start, end + 1))
-    return [int(x) for x in spec.split(",")]
 
 
 def build_env(args: argparse.Namespace):
@@ -94,6 +99,7 @@ def build_env(args: argparse.Namespace):
     cfg.max_episode_steps = args.max_episode_steps
     cfg.max_steps_per_rollout_epoch = args.max_episode_steps
     cfg.seed = args.seed
+    cfg.init_states_dir = args.init_states_dir
     cfg.video_cfg.save_video = False
     return LiberoEnv(
         cfg,
@@ -102,16 +108,6 @@ def build_env(args: argparse.Namespace):
         total_num_processes=1,
         worker_info=None,
     )
-
-
-def build_policy(args: argparse.Namespace, num_chunks_per_episode: int):
-    from rlinf.models import get_model
-
-    cfg = OmegaConf.load(args.model_cfg)
-    cfg.obs_history_reset_interval = num_chunks_per_episode
-    policy = get_model(cfg)
-    policy.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
-    return policy.to("cuda").eval()
 
 
 def main() -> None:
@@ -129,11 +125,11 @@ def main() -> None:
     num_chunks = args.max_episode_steps // num_actions
 
     env = build_env(args)
-    policy = build_policy(args, num_chunks)
+    policy = load_policy(args.model_cfg, args.ckpt, num_chunks)
 
-    trials = parse_trials(args.trials)
     bins = np.asarray(env.trial_id_bins)
-    tasks = parse_trials(args.tasks) if args.tasks else list(range(len(bins)))
+    trials = parse_ids(args.trials) if args.trials else list(range(bins.max()))
+    tasks = parse_ids(args.tasks) if args.tasks else list(range(len(bins)))
     starts = np.concatenate([[0], np.cumsum(bins)[:-1]])
     jobs = [
         (int(starts[task] + trial), task, trial, rerun)
@@ -187,12 +183,12 @@ def main() -> None:
                 "first_success_step": first,
                 "success_at_end": bool(success[slot, -1]),
             }
-            np.savez_compressed(
-                out / "episodes" / f"state_{state_id:03d}_rerun_{rerun}.npz",
+            save_episode(
+                out,
+                record,
                 frames=frames[slot],
                 actions=actions[slot],
                 step_success=success[slot],
-                **{k: np.asarray(v) for k, v in record.items()},
             )
             records.append(record)
             num_task_videos = sum(
@@ -214,26 +210,15 @@ def main() -> None:
         rate = np.mean([r["success"] for r in records])
         logger.info(f"{done}/{len(jobs)} episodes, success rate so far {rate:.3f}")
 
-    per_task = {}
-    for task in sorted({r["task_id"] for r in records}):
-        rows = [r for r in records if r["task_id"] == task]
-        per_task[task] = {
-            "task": rows[0]["task"],
-            "episodes": len(rows),
-            "success_rate": float(np.mean([r["success"] for r in rows])),
-        }
-    summary = {
-        "ckpt": os.path.abspath(args.ckpt),
-        "model_cfg": os.path.abspath(args.model_cfg),
-        "trials": trials,
-        "reruns": args.reruns,
-        "episodes": len(records),
-        "success_rate": float(np.mean([r["success"] for r in records])),
-        "success_at_end_rate": float(np.mean([r["success_at_end"] for r in records])),
-        "per_task": per_task,
-        "episodes_list": records,
-    }
-    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    summary = write_summary(
+        out,
+        records,
+        ckpt=os.path.abspath(args.ckpt),
+        model_cfg=os.path.abspath(args.model_cfg),
+        init_states_dir=args.init_states_dir,
+        trials=trials,
+        reruns=args.reruns,
+    )
     logger.info(
         f"Success rate {summary['success_rate']:.3f} over {len(records)} episodes "
         f"(success at step {args.max_episode_steps}: "

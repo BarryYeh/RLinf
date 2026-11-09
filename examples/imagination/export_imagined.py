@@ -12,14 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Write the Robometer-judged successes of imagined rollouts as a LeRobot v2 dataset.
+"""Write the labeled successes of rollouts as a LeRobot v2 dataset.
 
-``--rollouts`` is an ``imagine_rollouts.py`` output that ``robometer_judge.py`` has
-labeled. Of each state's successful rollouts, the ``--keep`` with the highest
-``mean_score`` are kept, each cut at its ``success_step``: row ``t`` holds frame ``t``
-and the action taken from it. The dataset at ``--out`` has the ``image`` and
-``actions`` features ``LeRobotFrameDataset`` reads, PNG-encoded like
-physical-intelligence/libero, and ``selection.json`` lists the kept episodes.
+``--rollouts`` holds ``episodes/*.npz`` from ``imagine_rollouts.py`` or
+``collect_rollouts.py``. ``--labels`` is a JSONL file with one row per episode
+(``episode``, ``state_id``, ``task``, ``success``, ``success_step``, and optionally
+``mean_score``); by default it is the ``robometer_judge.py`` output in ``--rollouts``,
+and ``--task-id`` keeps one task's rows.
+Of each state's successful rollouts, the ``--keep`` with the highest ``mean_score``
+are kept (rows without one keep their file order), each cut at its ``success_step``:
+row ``t`` holds frame ``t`` and the action taken from it. ``--all`` instead writes
+every rollout, successes cut the same way and failures at full length. The dataset at
+``--out`` has the ``image`` and ``actions`` features ``LeRobotFrameDataset`` reads,
+PNG-encoded like physical-intelligence/libero; ``meta/episodes.jsonl`` also records
+each episode's label and, for Robometer labels, its ``success_prob`` at
+``score_steps``. ``selection.json`` lists the kept episodes.
 """
 
 import argparse
@@ -43,9 +50,24 @@ DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rollouts", required=True, help="Judged imagined rollouts.")
+    parser.add_argument(
+        "--rollouts", required=True, help="Directory with episodes/*.npz."
+    )
+    parser.add_argument(
+        "--labels",
+        default=None,
+        help="Per-episode success labels; default: <rollouts>/robometer_judge.jsonl.",
+    )
     parser.add_argument("--out", required=True, help="Output LeRobot dataset dir.")
     parser.add_argument("--keep", type=int, default=4, help="Episodes kept per state.")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Write every rollout; failures keep their full length.",
+    )
+    parser.add_argument(
+        "--task-id", type=int, default=None, help="Only this task's rollouts."
+    )
     return parser.parse_args()
 
 
@@ -61,15 +83,21 @@ def main() -> None:
     if out.exists():
         raise FileExistsError(f"Expected a new output directory, found {out}.")
 
-    rows = [json.loads(line) for line in open(rollouts / "robometer_judge.jsonl")]
+    labels = Path(args.labels or rollouts / "robometer_judge.jsonl")
+    rows = [json.loads(line) for line in open(labels)]
+    if args.task_id is not None:
+        rows = [row for row in rows if row["task_id"] == args.task_id]
     by_state = defaultdict(list)
     for row in rows:
         if row["success"]:
             by_state[row["state_id"]].append(row)
     kept = []
-    for state_id in sorted(by_state):
-        ranked = sorted(by_state[state_id], key=lambda r: -r["mean_score"])
-        kept.extend(ranked[: args.keep])
+    if args.all:
+        kept = sorted(rows, key=lambda r: r["episode"])
+    else:
+        for state_id in sorted(by_state):
+            ranked = sorted(by_state[state_id], key=lambda r: -r.get("mean_score", 0.0))
+            kept.extend(ranked[: args.keep])
     states = {r["state_id"] for r in rows}
     logger.info(
         f"{sum(r['success'] for r in rows)}/{len(rows)} rollouts succeed; "
@@ -81,7 +109,7 @@ def main() -> None:
     episodes, index = [], 0
     for episode_index, row in enumerate(kept):
         with np.load(rollouts / "episodes" / f"{row['episode']}.npz") as episode:
-            length = row["success_step"]
+            length = row["success_step"] if row["success"] else len(episode["actions"])
             frames = episode["frames"][:length]
             actions = episode["actions"][:length].astype(np.float32)
         table = pa.table(
@@ -117,7 +145,14 @@ def main() -> None:
                 "length": length,
                 "source": row["episode"],
                 "state_id": row["state_id"],
-                "mean_score": row["mean_score"],
+                "mean_score": row.get("mean_score"),
+                "success": row["success"],
+                "success_step": row["success_step"],
+                **(
+                    {"success_prob": row["success_prob"], "score_steps": row["steps"]}
+                    if "success_prob" in row
+                    else {}
+                ),
             }
         )
 
@@ -165,7 +200,8 @@ def main() -> None:
         entry["frames"] += ep["length"]
     selection = {
         "rollouts": str(rollouts.resolve()),
-        "keep": args.keep,
+        "labels": str(labels.resolve()),
+        "keep": "all" if args.all else args.keep,
         "episodes": len(episodes),
         "frames": index,
         "per_task": {
