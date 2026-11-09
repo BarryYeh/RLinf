@@ -147,6 +147,15 @@ class LiberoEnv(gym.Env):
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
         self.task_id_filter = cfg.get("task_id_filter", None)
+        # Directory of per-task ``<init_states_file>`` arrays that replaces the
+        # benchmark's init_files; null uses the benchmark states.
+        self.init_states_dir = cfg.get("init_states_dir", None)
+        self._init_states_cache: dict[int, np.ndarray] = {}
+        if self.init_states_dir is not None and get_libero_type() != "standard":
+            raise ValueError(
+                "Expected init_states_dir only with standard LIBERO, got "
+                f"LIBERO_TYPE={get_libero_type()!r}."
+            )
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
 
@@ -477,7 +486,7 @@ class LiberoEnv(gym.Env):
         self.total_num_group_envs = 0
         self.trial_id_bins = []
         for task_id in range(self.task_suite.get_num_tasks()):
-            task_num_trials = len(self.task_suite.get_task_init_states(task_id))
+            task_num_trials = len(self._task_init_states(task_id))
             self.trial_id_bins.append(task_num_trials)
             self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
@@ -679,12 +688,30 @@ class LiberoEnv(gym.Env):
             return init_state
 
         init_state = [
-            self.task_suite.get_task_init_states(self.task_ids[env_id])[
-                self.trial_ids[env_id]
-            ]
+            self._task_init_states(self.task_ids[env_id])[self.trial_ids[env_id]]
             for env_id in env_idx
         ]
         return init_state
+
+    def _task_init_states(self, task_id: int) -> np.ndarray:
+        """Initial states of one task, from ``init_states_dir`` if set."""
+        task_id = int(task_id)
+        if task_id not in self._init_states_cache:
+            if self.init_states_dir is None:
+                states = self.task_suite.get_task_init_states(task_id)
+            else:
+                path = os.path.join(
+                    self.init_states_dir,
+                    self.task_suite.get_task(task_id).init_states_file,
+                )
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(
+                        f"Expected init states of task {task_id} at {path}, "
+                        "found no file."
+                    )
+                states = torch.load(path, weights_only=False)
+            self._init_states_cache[task_id] = states
+        return self._init_states_cache[task_id]
 
     @property
     def elapsed_steps(self):

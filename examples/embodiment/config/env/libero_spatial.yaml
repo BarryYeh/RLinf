@@ -25,6 +25,7 @@ use_ordered_reset_state_ids: False
 # if set 0, the env always use the task 0 and trial 0 in the libero-spatial suite; 
 # if set null, the initial states will be sampled from the whole libero-spatial suite. )
 specific_reset_id: null # can be a number or null.
+init_states_dir: null # directory of per-task init-state files; null uses the benchmark's init_files.
 
 video_cfg:
   save_video: True
