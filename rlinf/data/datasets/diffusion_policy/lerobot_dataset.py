@@ -100,7 +100,9 @@ class LeRobotFrameDataset(Dataset):
     episode's instruction (``task``); indices outside the episode repeat its first
     frame or last action. ``episodes_per_task`` keeps that many episodes of each
     task, chosen by ``subsample_seed``; a smaller count keeps a subset of a larger
-    one. Images
+    one. ``advantage_tag`` reads ``meta/advantages_<tag>.parquet`` (columns
+    ``episode_index``, ``frame_index``, ``advantage``) and samples only the frames
+    labeled ``True``; the other frames still serve as history. Images
     must be stored in the parquet files (feature dtype ``image``). The selected
     frames are decoded once into a uint8 memmap under ``cache_dir`` so DataLoader
     workers share them through the page cache.
@@ -119,6 +121,7 @@ class LeRobotFrameDataset(Dataset):
         tasks: Optional[set[str]] = None,
         episodes_per_task: Optional[int] = None,
         subsample_seed: int = 0,
+        advantage_tag: Optional[str] = None,
     ):
         self.root = Path(root).expanduser().resolve()
         self.n_obs_steps = n_obs_steps
@@ -171,13 +174,16 @@ class LeRobotFrameDataset(Dataset):
         self.ends = self.starts + self.lengths
 
         self.actions = self._load_actions(action_key)
+        self.sample_indices = (
+            self._load_positive_frames(advantage_tag) if advantage_tag else None
+        )
         self.frames_path = self._build_frame_cache(
             image_key, tuple(features[image_key]["shape"]), Path(cache_dir)
         )
         self._frames: Optional[np.ndarray] = None
         logger.info(
-            f"LeRobotFrameDataset: {len(episodes)} episodes, {len(self)} frames "
-            f"from {self.root}"
+            f"LeRobotFrameDataset: {len(episodes)} episodes, {len(self)} of "
+            f"{int(self.ends[-1])} frames sampled from {self.root}"
         )
 
     def _parquet_path(self, info: dict[str, Any], episode: dict[str, Any]) -> Path:
@@ -200,6 +206,34 @@ class LeRobotFrameDataset(Dataset):
                 )
             actions.append(episode_actions)
         return np.concatenate(actions)
+
+    def _load_positive_frames(self, advantage_tag: str) -> np.ndarray:
+        """Global frame indices labeled ``advantage=True`` in the kept episodes."""
+        import pyarrow.parquet as pq
+
+        path = self.root / "meta" / f"advantages_{advantage_tag}.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Expected advantage labels at {path}.")
+        table = pq.read_table(
+            path, columns=["episode_index", "frame_index", "advantage"]
+        ).to_pydict()
+        position = {index: i for i, index in enumerate(self.episode_indices)}
+        indices = []
+        for episode, frame, positive in zip(
+            table["episode_index"], table["frame_index"], table["advantage"]
+        ):
+            i = position.get(int(episode))
+            if i is None or not positive:
+                continue
+            if not 0 <= frame < self.lengths[i]:
+                raise ValueError(
+                    f"Expected frame_index in [0, {self.lengths[i]}) for episode "
+                    f"{episode} in {path}, got {frame}."
+                )
+            indices.append(int(self.starts[i]) + int(frame))
+        if not indices:
+            raise ValueError(f"Expected positive frames in {path}, found none.")
+        return np.unique(np.asarray(indices, dtype=np.int64))
 
     def _build_frame_cache(
         self, image_key: str, image_shape: tuple[int, ...], cache_dir: Path
@@ -254,11 +288,15 @@ class LeRobotFrameDataset(Dataset):
         return state
 
     def __len__(self) -> int:
+        if self.sample_indices is not None:
+            return len(self.sample_indices)
         return int(self.ends[-1])
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if self._frames is None:
             self._frames = np.load(self.frames_path, mmap_mode="r")
+        if self.sample_indices is not None:
+            index = int(self.sample_indices[index])
         episode = int(np.searchsorted(self.ends, index, side="right"))
         start, length = int(self.starts[episode]), int(self.lengths[episode])
         t = index - start
@@ -278,21 +316,23 @@ def build_diffusion_policy_datasets(
 ) -> list[LeRobotFrameDataset]:
     """One dataset per path, sampled with the model's history and horizon.
 
-    ``data_cfg.episodes_per_task`` is one count (or null) for every path, or a list
-    with one entry per path.
+    ``data_cfg.episodes_per_task`` and ``data_cfg.advantage_tag`` are each one value
+    (or null) for every path, or a list with one entry per path.
     """
     paths = [data_paths] if isinstance(data_paths, str) else list(data_paths)
     task_suite_name = data_cfg.get("task_suite_name", None)
     tasks = libero_suite_tasks(task_suite_name) if task_suite_name else None
-    episodes_per_task = data_cfg.get("episodes_per_task", None)
-    if isinstance(episodes_per_task, Sequence):
-        if len(episodes_per_task) != len(paths):
+
+    def per_path(key: str) -> list[Any]:
+        value = data_cfg.get(key, None)
+        if isinstance(value, str) or not isinstance(value, Sequence):
+            return [value] * len(paths)
+        if len(value) != len(paths):
             raise ValueError(
-                f"Expected one episodes_per_task entry per path ({len(paths)}), got "
-                f"{len(episodes_per_task)}."
+                f"Expected one {key} entry per path ({len(paths)}), got {len(value)}."
             )
-    else:
-        episodes_per_task = [episodes_per_task] * len(paths)
+        return list(value)
+
     return [
         LeRobotFrameDataset(
             root=path,
@@ -306,6 +346,9 @@ def build_diffusion_policy_datasets(
             tasks=tasks,
             episodes_per_task=count,
             subsample_seed=data_cfg.get("subsample_seed", 0),
+            advantage_tag=tag,
         )
-        for path, count in zip(paths, episodes_per_task)
+        for path, count, tag in zip(
+            paths, per_path("episodes_per_task"), per_path("advantage_tag")
+        )
     ]

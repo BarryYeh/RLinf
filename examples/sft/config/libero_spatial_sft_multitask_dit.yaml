@@ -46,6 +46,9 @@ data:
   # counts keep a subset of larger ones. A list gives one count per train_data_paths entry.
   episodes_per_task: null
   subsample_seed: 0
+  # Samples only the frames labeled True in meta/advantages_<tag>.parquet of a dataset;
+  # null samples every frame. A list gives one tag (or null) per train_data_paths entry.
+  advantage_tag: null
   # One weight per train_data_paths entry: each path fills that share of the samples.
   # null samples every frame equally.
   sampling_weights: null

@@ -3740,3 +3740,64 @@ def test_diffusion_policy_dataset_subsamples_nested_episodes_per_task(tmp_path):
     assert kept(2) == (two, two_tasks)
     with pytest.raises(ValueError, match="at least 5 episodes"):
         kept(5)
+
+
+def _write_advantages(root: Path, tag: str, positive: dict[int, list[int]]) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    episodes = _read_episode_lengths(root)
+    rows = [
+        (episode, frame, frame in positive.get(episode, []))
+        for episode, length in episodes.items()
+        for frame in range(length)
+    ]
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [r[0] for r in rows],
+                "frame_index": [r[1] for r in rows],
+                "advantage": [r[2] for r in rows],
+            }
+        ),
+        root / "meta" / f"advantages_{tag}.parquet",
+    )
+
+
+def _read_episode_lengths(root: Path) -> dict[int, int]:
+    with (root / "meta" / "episodes.jsonl").open() as f:
+        episodes = [json.loads(line) for line in f]
+    return {ep["episode_index"]: ep["length"] for ep in episodes}
+
+
+def test_diffusion_policy_dataset_samples_only_positive_frames_with_full_history(
+    tmp_path,
+):
+    _write_lerobot_v2_dataset(tmp_path / "data", [("task a", 5), ("task b", 6)])
+    _write_advantages(tmp_path / "data", "q30", {0: [4], 1: [0, 3]})
+    dataset = _diffusion_policy_dataset(
+        tmp_path / "data", tmp_path / "cache", advantage_tag="q30"
+    )
+    assert len(dataset) == 3
+
+    last_of_first_episode = dataset[0]
+    assert last_of_first_episode["images"][:, 0, 0, 0].tolist() == [1, 4]
+    assert last_of_first_episode["actions"][:, 0].tolist() == [4, 4, 4, 4]
+    assert dataset[1]["actions"][:, 1].tolist() == [1, 1, 1, 1]
+    assert dataset[2]["images"][:, 0, 0, 0].tolist() == [0, 3]
+
+    with pytest.raises(FileNotFoundError, match="advantages_q20"):
+        _diffusion_policy_dataset(
+            tmp_path / "data", tmp_path / "cache", advantage_tag="q20"
+        )
+
+
+def test_diffusion_policy_dataset_rejects_advantage_labels_without_positives(
+    tmp_path,
+):
+    _write_lerobot_v2_dataset(tmp_path / "data", [("task a", 5)])
+    _write_advantages(tmp_path / "data", "none", {})
+    with pytest.raises(ValueError, match="positive frames"):
+        _diffusion_policy_dataset(
+            tmp_path / "data", tmp_path / "cache", advantage_tag="none"
+        )
