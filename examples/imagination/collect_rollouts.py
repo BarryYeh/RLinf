@@ -14,8 +14,8 @@
 
 """Roll out a frame-history policy in LIBERO and save every episode with its init state.
 
-``--model-cfg`` selects the policy config (``diffusion_policy`` or
-``multitask_dit``); ``--ckpt`` is its SFT ``full_weights.pt``.
+``--model-cfg`` selects the Multitask DiT policy config; ``--ckpt`` is its
+SFT ``full_weights.pt``.
 
 Each episode is written to ``<out>/episodes/state_<id>_rerun_<k>.npz`` with the
 main-camera frames (the reset frame plus one per step), the executed actions, the
@@ -44,7 +44,7 @@ logger = get_logger()
 
 REPO_PATH = Path(__file__).resolve().parents[2]
 ENV_CFG = REPO_PATH / "examples/embodiment/config/env/libero_spatial.yaml"
-DEFAULT_MODEL_CFG = REPO_PATH / "examples/embodiment/config/model/diffusion_policy.yaml"
+DEFAULT_MODEL_CFG = REPO_PATH / "examples/embodiment/config/model/multitask_dit.yaml"
 
 
 def parse_args() -> argparse.Namespace:
