@@ -126,6 +126,7 @@ select_anchors() {
   read -ra extra <<< "$ANCHOR_ARGS"
   $PY "$IMAGINATION/select_anchors.py" --method "$ANCHOR_METHOD" --real "$RUN/real" \
     --ckpt "$BASE_CKPT" --model-cfg "$MODEL_CFG" --out "$RUN/anchors.json" \
+    --rnd-demos "$DEMOS" --rnd-val-run "$VAL_REAL" --rnd-cache-dir "$CACHE_DIR" \
     --seed "$SEED" "${extra[@]}" > "$RUN/anchors.log" 2>&1
 }
 

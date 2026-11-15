@@ -21,6 +21,8 @@ subclasses ``AnchorScore`` and is added there.
 """
 
 import argparse
+import copy
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import ClassVar, Iterator
@@ -28,6 +30,7 @@ from typing import ClassVar, Iterator
 import numpy as np
 import torch
 from common import episode_name, load_policy, load_records
+from torch import nn
 
 from rlinf.utils.logging import get_logger
 
@@ -204,4 +207,226 @@ class ActionChunkEntropy(AnchorScore):
         return paths
 
 
-SCORES: dict[str, type[AnchorScore]] = {"ace": ActionChunkEntropy}
+class RandomNetworkDistillation(nn.Module):
+    """FIPER's RND-OE networks (``rnd/rnd_models.py:RND_OE``); the forward is the error.
+
+    The predictor learns to match the frozen, randomly initialized target, so its
+    error is small on inputs like its training data.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int = 512):
+        super().__init__()
+        self.target = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.LeakyReLU(),
+            nn.Linear(1024, 2048),
+            nn.LeakyReLU(),
+            nn.Linear(2048, 4096),
+            nn.LeakyReLU(),
+            nn.Linear(4096, output_dim),
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.LeakyReLU(),
+            nn.Linear(1024, 2048),
+            nn.LeakyReLU(),
+            nn.Linear(2048, 4096),
+            nn.LeakyReLU(),
+            nn.Linear(4096, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, output_dim),
+        )
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, np.sqrt(2))
+                nn.init.zeros_(layer.bias)
+        self.target.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (self.predictor(x) - self.target(x)).norm(dim=-1)
+
+
+class RndObservationEmbedding(AnchorScore):
+    """FIPER's RND-OE: random network distillation on the policy's observation
+    embedding, here its denoiser condition (``encode_obs``: frame-history CLS
+    features and instruction features).
+
+    The predictor trains on every frame of the ``--rnd-task-suite`` demonstrations
+    in ``--rnd-demos`` (with the frame history the policy trains on). The successes
+    of ``--rnd-val-run``, a ``collect_rollouts.py`` run on other initial states, at
+    their boundaries before success, pick the best epoch and stop training after
+    ``--rnd-patience`` epochs without improvement. Optimizer and schedule follow
+    FIPER's ``configs/eval/rnd_parameters.yaml``.
+    """
+
+    name = "rnd_oe"
+    LR, LR_MIN, WEIGHT_DECAY, BATCH_SIZE = 1e-4, 1e-6, 1e-5, 256
+
+    def __init__(self, args: argparse.Namespace):
+        super().__init__(args)
+        missing = [
+            f"--rnd-{k.replace('_', '-')}"
+            for k in ("demos", "val_run", "cache_dir")
+            if getattr(args, f"rnd_{k}") is None
+        ]
+        if missing:
+            raise ValueError(f"Expected {', '.join(missing)} with --method rnd_oe.")
+
+    @staticmethod
+    def add_args(group: argparse._ArgumentGroup) -> None:
+        group.add_argument("--rnd-demos", help="LeRobot v2 demonstrations (training).")
+        group.add_argument(
+            "--rnd-val-run", help="collect_rollouts.py run whose successes validate."
+        )
+        group.add_argument("--rnd-cache-dir", help="Decoded demo frame cache.")
+        group.add_argument("--rnd-task-suite", default="libero_spatial")
+        group.add_argument("--rnd-epochs", type=int, default=250)
+        group.add_argument("--rnd-patience", type=int, default=7)
+
+    def settings(self) -> dict:
+        args = self.args
+        return {
+            "demos": os.path.abspath(args.rnd_demos),
+            "val_run": os.path.abspath(args.rnd_val_run),
+            "task_suite": args.rnd_task_suite,
+            "epochs": args.rnd_epochs,
+            "patience": args.rnd_patience,
+        }
+
+    @torch.no_grad()
+    def _encode(self, policy, batches) -> torch.Tensor:
+        return torch.cat(
+            [policy.encode_obs(images, tasks) for images, tasks in batches]
+        )
+
+    def _demo_embeddings(self, policy) -> torch.Tensor:
+        from rlinf.data.datasets.diffusion_policy.lerobot_dataset import (
+            LeRobotFrameDataset,
+            libero_suite_tasks,
+        )
+
+        cfg = policy.cfg
+        dataset = LeRobotFrameDataset(
+            root=self.args.rnd_demos,
+            n_obs_steps=cfg.n_obs_steps,
+            obs_stride=cfg.num_action_chunks,
+            horizon=cfg.horizon,
+            action_dim=cfg.action_dim,
+            cache_dir=self.args.rnd_cache_dir,
+            tasks=libero_suite_tasks(self.args.rnd_task_suite),
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=self.args.batch_size, num_workers=8
+        )
+        logger.info(f"rnd_oe: embedding {len(dataset)} demonstration frames")
+        return self._encode(policy, ((b["images"], b["task"]) for b in loader))
+
+    def _run_embeddings(self, policy, run: RealRun) -> torch.Tensor:
+        """``[episodes, num_chunks, D]`` embeddings of every boundary of ``run``."""
+        per_call = max(1, self.args.batch_size // run.num_chunks)
+        batches = (
+            (torch.from_numpy(histories), tasks)
+            for _, histories, tasks in run.boundaries(policy.cfg.n_obs_steps, per_call)
+        )
+        return self._encode(policy, batches).view(len(run.records), run.num_chunks, -1)
+
+    def score(self, run: RealRun) -> np.ndarray:
+        args = self.args
+        policy = load_policy(args.model_cfg, args.ckpt, run.num_chunks)
+        train = self._demo_embeddings(policy).float()
+        val_run = RealRun(args.rnd_val_run, run.chunk)
+        val_all = self._run_embeddings(policy, val_run)
+        val = torch.cat(
+            [
+                val_all[i, : val_run.pre_success_chunks(r)]
+                for i, r in enumerate(val_run.records)
+                if r["success"]
+            ]
+        ).float()
+        embeddings = self._run_embeddings(policy, run).float()
+        del policy
+
+        model = self._fit(train, val)
+        with torch.no_grad():
+            errors = torch.cat([model(x) for x in embeddings.flatten(0, 1).split(4096)])
+            errors = errors.view(len(run.records), run.num_chunks).cpu().numpy()
+            gap = {
+                "demos": self._mean_error(model, train),
+                "validation successes": self._mean_error(model, val),
+            }
+        success = np.array([r["success"] for r in run.records])
+        before = [
+            errors[i, : run.pre_success_chunks(r)]
+            for i, r in enumerate(run.records)
+            if r["success"]
+        ]
+        gap["scored successes"] = float(np.concatenate(before).mean())
+        gap["scored failures"] = float(errors[~success].mean())
+        logger.info(
+            "rnd_oe: mean error (successes before success) "
+            + ", ".join(f"{k} {v:.4f}" for k, v in gap.items())
+        )
+        return errors
+
+    @staticmethod
+    def _mean_error(model: nn.Module, x: torch.Tensor) -> float:
+        return float(torch.cat([model(b) for b in x.split(4096)]).mean())
+
+    def _fit(self, train: torch.Tensor, val: torch.Tensor) -> nn.Module:
+        """Train the predictor on ``train``; return the best weights on ``val``."""
+        args = self.args
+        torch.manual_seed(args.seed)
+        model = RandomNetworkDistillation(train.shape[1]).to(train.device)
+        optimizer = torch.optim.AdamW(
+            model.predictor.parameters(),
+            lr=self.LR,
+            eps=1e-8,
+            weight_decay=self.WEIGHT_DECAY,
+        )
+        schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.rnd_epochs, eta_min=self.LR_MIN
+        )
+        logger.info(
+            f"rnd_oe: training on {len(train)} demo frames, validating on "
+            f"{len(val)} success boundaries"
+        )
+        best, best_state, stale = float("inf"), None, 0
+        for epoch in range(args.rnd_epochs):
+            model.train()
+            losses = []
+            for ids in torch.randperm(len(train), device=train.device).split(
+                self.BATCH_SIZE
+            ):
+                loss = model(train[ids]).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+            schedule.step()
+            model.eval()
+            with torch.no_grad():
+                val_loss = self._mean_error(model, val)
+            if val_loss < best:
+                best, best_state, stale = val_loss, copy.deepcopy(model.state_dict()), 0
+            else:
+                stale += 1
+            if epoch % 10 == 0 or stale >= args.rnd_patience:
+                logger.info(
+                    f"rnd_oe: epoch {epoch} train {np.mean(losses):.4f} "
+                    f"validation {val_loss:.4f} (best {best:.4f})"
+                )
+            if stale >= args.rnd_patience:
+                logger.info(
+                    f"rnd_oe: stopped at epoch {epoch}, best validation {best:.4f}"
+                )
+                break
+        model.load_state_dict(best_state)
+        return model.eval()
+
+
+SCORES: dict[str, type[AnchorScore]] = {
+    "ace": ActionChunkEntropy,
+    "rnd_oe": RndObservationEmbedding,
+}

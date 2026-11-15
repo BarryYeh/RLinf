@@ -207,7 +207,8 @@ class MultitaskDiTPolicy(nn.Module, BasePolicy):
             features = self.text_encoder(**tokens).pooler_output
         return self.text_proj(features)
 
-    def _encode_obs(self, images: torch.Tensor, tasks: list[str]) -> torch.Tensor:
+    def encode_obs(self, images: torch.Tensor, tasks: list[str]) -> torch.Tensor:
+        """The denoiser condition: CLS features of ``[B, S, H, W, 3]`` uint8 frames and the instruction features, ``[B, S * D + hidden_dim]``."""
         if len(tasks) != images.shape[0]:
             raise ValueError(
                 f"Expected one instruction per sample, got {len(tasks)} for "
@@ -223,7 +224,7 @@ class MultitaskDiTPolicy(nn.Module, BasePolicy):
         return super().forward(forward_type=forward_type, **kwargs)
 
     def sft_forward(self, data: dict[str, Any]) -> dict[str, torch.Tensor]:
-        cond = self._encode_obs(data["images"], data["task"])
+        cond = self.encode_obs(data["images"], data["task"])
         actions = self.normalize_actions(data["actions"].to(cond.device).float())
         noise = torch.randn_like(actions)
         timesteps = torch.randint(
@@ -255,7 +256,7 @@ class MultitaskDiTPolicy(nn.Module, BasePolicy):
         Returns ``[B * num_samples, horizon, action_dim]``; the ``num_samples``
         draws for one input are adjacent, and the observation is encoded once.
         """
-        cond = self._encode_obs(images, tasks).repeat_interleave(num_samples, dim=0)
+        cond = self.encode_obs(images, tasks).repeat_interleave(num_samples, dim=0)
         sample = torch.randn(
             (cond.shape[0], self.cfg.horizon, self.cfg.action_dim),
             generator=generator,

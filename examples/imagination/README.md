@@ -109,7 +109,7 @@ bash examples/imagination/run_protocol.sh ~/datastorage/runs/imagination/protoco
 | Stage | Does | Settings | Time |
 |---|---|---|---|
 | `real` | Base policy in LIBERO on the imagination states | 4 reruns per state (1,200 episodes) | ~2 h |
-| `anchors` | Only with `ANCHOR_METHOD` set: [failure anchors](#failure-anchors) from the real run | `ace`, 90th percentile, 2 chunks, 16-step lead | — |
+| `anchors` | Only with `ANCHOR_METHOD` set: [failure anchors](#failure-anchors) from the real run | `ace` or `rnd_oe`, 90th percentile, 2 chunks, 16-step lead | — |
 | `imagine` | Base policy closed loop in the WM from each state's real reset frame | 8 rollouts per state (2,400 episodes), 4 parallel parts | ~18 h |
 | `judge` | Robometer success calls on the imagined rollouts | threshold 0.5, 3 frames in a row, stride 8 | ~1 h |
 | `export` | One dataset per task: per state, the top 4 judged successes, cut at `success_step` | — | minutes |
@@ -172,6 +172,7 @@ The simulator already says which real episodes failed; the anchor only has to sa
 | `--method` | Score | Options |
 |---|---|---|
 | `ace` | FIPER's action-chunk entropy: the policy draws 32 chunks over its 32-step horizon; at each horizon step, the Shannon entropy of their end-effector paths (cumulative xyz deltas) on a grid whose cells are 3% of each axis's range over the successes; the mean over steps | `--ace-samples`, `--ace-cell-size` |
+| `rnd_oe` | FIPER's RND-OE: random network distillation on the policy's observation embedding (`encode_obs`, 2304-d). The predictor trains on every frame of the LIBERO-Spatial demos (`--rnd-demos`, all 432); the successes of `--rnd-val-run` (other initial states) pick the best epoch and stop training; the score is the predictor's error | `--rnd-demos`, `--rnd-val-run`, `--rnd-cache-dir`, `--rnd-task-suite`, `--rnd-epochs`, `--rnd-patience` |
 
 Steps 2–4 live in `select_anchors.py` and are the same for every score.
 `anchor_scores.py` holds step 1: `RealRun` reads a real run at its chunk boundaries, and each score subclasses `AnchorScore` (its options, `settings()`, and `score()`, which returns one value per boundary) and joins `SCORES`.
@@ -179,12 +180,14 @@ The scores follow the reference code of [FIPER](https://github.com/learnsyslab/f
 
 ```bash
 python examples/imagination/select_anchors.py --method ace --real <run>/real --ckpt <policy> --out <run>/anchors.json
+python examples/imagination/select_anchors.py --method rnd_oe --real <run>/real --ckpt <policy> --out <run>/anchors.json \
+  --rnd-demos <libero> --rnd-val-run <validation real run> --rnd-cache-dir <frame cache>
 python examples/imagination/imagine_rollouts.py --mode policy --real <run>/real --anchors <run>/anchors.json ...
 ```
 
 `anchors.json` holds the method and settings, the thresholds, `sources` (each state's start points), and per episode its scores, alarm, and anchor.
 The scores are cached in `<method>.npz` beside it and reused while the checkpoint, seed, method settings and episodes match.
-In the protocol, `ANCHOR_METHOD` picks the method and `ANCHOR_ARGS` passes more options.
+In the protocol, `ANCHOR_METHOD` picks the method, `ANCHOR_ARGS` passes more options, and RND-OE uses `DEMOS` and `VAL_REAL`.
 
 ### Measuring WM dynamics error
 
