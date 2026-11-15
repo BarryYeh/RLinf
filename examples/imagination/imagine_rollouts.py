@@ -21,20 +21,23 @@ frame, written to ``<out>/init_frames/`` in its trajectory format; the condition
 window repeats it with the env's reset condition actions, at any anchor.
 
 ``--mode policy`` runs the policy closed loop in the world model, ``--reruns`` times
-per state, from the state's rerun 0. ``--mode replay`` feeds each real episode's
-actions from the anchor on to the world model open loop, starting from that
-episode's own frame; it measures the dynamics without the policy reacting to
-generated frames.
+per state, from the state's rerun 0. With ``--anchors`` (a ``select_anchors.py``
+output) each state instead has a list of start points, each a real rerun and its own
+anchor step, and imagined rerun ``k`` starts from point ``k`` modulo their number.
+``--mode replay`` feeds each real episode's actions from the anchor on to the world
+model open loop, starting from that episode's own frame; it measures the dynamics
+without the policy reacting to generated frames.
 
 Each episode is written to ``<out>/episodes/state_<id>_rerun_<k>.npz`` with the
 generated frames (the initial frame plus one per step), the actions, the world
 model's reward-model success probability (``rm_reward``) and call (``step_success``:
-``rm_reward >= --success-threshold``), ``anchor_step``, and the LIBERO task, trial
-and init-state ids. ``summary.json`` holds the success rates. Run it in the OpenSora
-environment.
+``rm_reward >= --success-threshold``), ``anchor_step``, ``source_rerun`` (the real
+rerun it starts from), and the LIBERO task, trial and init-state ids.
+``summary.json`` holds the success rates. Run it in the OpenSora environment.
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -65,6 +68,7 @@ RECORD_KEYS = (
     "rerun",
     "task",
     "anchor_step",
+    "source_rerun",
     "success",
     "first_success_step",
     "success_at_end",
@@ -103,6 +107,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help=f"Real step the episode starts from; a multiple of {CHUNK}.",
     )
+    parser.add_argument(
+        "--anchors",
+        default=None,
+        help="select_anchors.py output with per-state start points (policy mode); "
+        "replaces --anchor-step.",
+    )
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--max-episode-steps", type=int, default=240)
     parser.add_argument("--success-threshold", type=float, default=0.9)
@@ -116,10 +126,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_anchors(path: str, states: list[int]) -> dict[int, list[tuple[int, int]]]:
+    """Each state's ``(real rerun, anchor step)`` start points from ``path``."""
+    sources = json.loads(Path(path).read_text())["sources"]
+    missing = [s for s in states if str(s) not in sources]
+    if missing:
+        raise ValueError(
+            f"Expected start points for every state in {path}, found none for "
+            f"states {missing}."
+        )
+    return {
+        s: [(e["rerun"], e["anchor_step"]) for e in sources[str(s)]] for s in states
+    }
+
+
 def write_init_frames(
-    real: Path, sources: list[tuple[int, int]], anchor: int, out: Path
+    real: Path, anchors: dict[tuple[int, int], int], out: Path
 ) -> dict[tuple[int, int], int]:
-    """Write one single-frame trajectory per ``(state_id, rerun)`` source episode.
+    """Write one single-frame trajectory per ``(state_id, rerun)`` source episode,
+    from its frame at its anchor step.
 
     Returns each source's index in the world model's dataset, which lists the
     trajectory files in sorted order.
@@ -128,7 +153,7 @@ def write_init_frames(
     init_dir.mkdir(parents=True, exist_ok=True)
     for stale in init_dir.glob("*.npy"):
         stale.unlink()
-    for state_id, rerun in sources:
+    for (state_id, rerun), anchor in anchors.items():
         name = episode_name(state_id, rerun)
         with np.load(real / "episodes" / f"{name}.npz") as episode:
             frame = {
@@ -142,7 +167,7 @@ def write_init_frames(
         )
     names = sorted(str(p) for p in init_dir.glob("*.npy"))
     return {
-        src: names.index(str(init_dir / f"{episode_name(*src)}.npy")) for src in sources
+        src: names.index(str(init_dir / f"{episode_name(*src)}.npy")) for src in anchors
     }
 
 
@@ -179,19 +204,16 @@ def main() -> None:
     args = parse_args()
     if args.mode == "policy" and args.ckpt is None:
         raise ValueError("Expected --ckpt in policy mode, got none.")
-    anchor = args.anchor_step
-    if anchor % CHUNK or not 0 <= anchor < args.max_episode_steps:
+    if args.anchors and (args.mode != "policy" or args.anchor_step):
         raise ValueError(
-            f"Expected --anchor-step a multiple of {CHUNK} in [0, "
-            f"{args.max_episode_steps}), got {anchor}."
+            f"Expected --anchors in policy mode with --anchor-step 0, got mode "
+            f"{args.mode} and --anchor-step {args.anchor_step}."
         )
     if args.max_episode_steps % CHUNK != 0:
         raise ValueError(
             f"Expected --max-episode-steps divisible by the world-model chunk {CHUNK}, "
             f"got {args.max_episode_steps}."
         )
-    num_steps = args.max_episode_steps - anchor
-    num_chunks = num_steps // CHUNK
     real, out = Path(args.real), Path(args.out)
     (out / "episodes").mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
@@ -207,13 +229,31 @@ def main() -> None:
     }
     states = sorted(meta)
     jobs = [(s, k) for k in range(args.reruns) for s in states]
-    # Policy episodes start from the state's rerun 0, replays from their own episode.
-    source = {job: (job[0], 0 if args.mode == "policy" else job[1]) for job in jobs}
-    dataset_index = write_init_frames(real, sorted(set(source.values())), anchor, out)
+    # Each job's (real rerun, anchor step): with --anchors the state's start points
+    # in turn, else policy episodes start from rerun 0 and replays from their own
+    # episode.
+    if args.anchors:
+        points = load_anchors(args.anchors, states)
+        start = {(s, k): points[s][k % len(points[s])] for s, k in jobs}
+    else:
+        start = {
+            (s, k): (0 if args.mode == "policy" else k, args.anchor_step)
+            for s, k in jobs
+        }
+    for job, (_, anchor) in start.items():
+        if anchor % CHUNK or not 0 <= anchor < args.max_episode_steps:
+            raise ValueError(
+                f"Expected anchor steps that are multiples of {CHUNK} in [0, "
+                f"{args.max_episode_steps}), got {anchor} for {episode_name(*job)}."
+            )
+    anchors = {(s, r): a for (s, _), (r, a) in start.items()}
+    dataset_index = write_init_frames(real, anchors, out)
     num_episodes = len(jobs)
+    steps = sorted({a for _, a in start.values()})
     logger.info(
         f"{args.mode}: {num_episodes} episodes from {len(states)} states x "
-        f"{args.reruns} reruns from step {anchor}, {args.num_envs} envs per batch"
+        f"{args.reruns} reruns from {len(anchors)} real episodes at steps "
+        f"{steps[0]}-{steps[-1]}, {args.num_envs} envs per batch"
     )
     # Episodes a previous run of the same command saved are kept, not rerun.
     results = []
@@ -222,22 +262,25 @@ def main() -> None:
         if path.exists():
             with np.load(path) as episode:
                 record = {k: episode[k].item() for k in RECORD_KEYS}
-            if record["anchor_step"] != anchor:
+            found = (record["source_rerun"], record["anchor_step"])
+            if found != start[job]:
                 raise ValueError(
-                    f"Expected saved {path.name} to start at step {anchor}, found "
-                    f"{record['anchor_step']}; use a new --out."
+                    f"Expected saved {path.name} to start from (rerun, step) "
+                    f"{start[job]}, found {found}; use a new --out."
                 )
             results.append(record)
     if results:
         done = {(r["state_id"], r["rerun"]) for r in results}
         jobs = [job for job in jobs if job not in done]
         logger.info(f"Kept {len(results)} saved episodes, {len(jobs)} to run")
+    # Sorted by anchor step, a batch's episodes have about the same length.
+    jobs.sort(key=lambda job: start[job][1])
 
-    env = build_env(args, out / "init_frames", num_steps)
+    env = build_env(args, out / "init_frames", args.max_episode_steps)
     if env.chunk != CHUNK:
         raise ValueError(f"Expected a world-model chunk of {CHUNK}, got {env.chunk}.")
     policy = (
-        load_policy(args.model_cfg, args.ckpt, num_chunks)
+        load_policy(args.model_cfg, args.ckpt, args.max_episode_steps // CHUNK)
         if args.mode == "policy"
         else None
     )
@@ -246,14 +289,21 @@ def main() -> None:
         batch = jobs[batch_start : batch_start + args.num_envs]
         # The env needs a full batch; padding slots repeat the first job and are dropped.
         padded = batch + [batch[0]] * (args.num_envs - len(batch))
+        # Each episode ends at the real episode's last step; the batch runs until
+        # its earliest-anchored episode does.
+        num_chunks = (args.max_episode_steps - start[batch[0]][1]) // CHUNK
         if policy is None:
             real_actions = []
             for job in padded:
-                with np.load(real / "episodes" / f"{episode_name(*job)}.npz") as ep:
+                rerun, anchor = start[job]
+                name = episode_name(job[0], rerun)
+                with np.load(real / "episodes" / f"{name}.npz") as ep:
                     real_actions.append(ep["actions"][anchor:])
             real_actions = np.stack(real_actions).astype(np.float32)
         obs, _ = env.reset(
-            episode_indices=np.array([dataset_index[source[job]] for job in padded])
+            episode_indices=np.array(
+                [dataset_index[(job[0], start[job][0])] for job in padded]
+            )
         )
         if policy is not None:
             policy.reset()
@@ -277,7 +327,9 @@ def main() -> None:
         rm_reward = np.concatenate(rm_reward, axis=1)  # [B, T]
         for slot, (state_id, rerun) in enumerate(batch):
             task_id, trial_id, task = meta[state_id]
-            step_success = rm_reward[slot] >= args.success_threshold
+            source_rerun, anchor = start[(state_id, rerun)]
+            length = args.max_episode_steps - anchor
+            step_success = rm_reward[slot, :length] >= args.success_threshold
             hits = np.flatnonzero(step_success)
             record = {
                 "state_id": state_id,
@@ -286,17 +338,18 @@ def main() -> None:
                 "rerun": rerun,
                 "task": task,
                 "anchor_step": anchor,
+                "source_rerun": source_rerun,
                 "success": bool(len(hits)),
                 "first_success_step": int(hits[0]) + 1 if len(hits) else -1,
                 "success_at_end": bool(step_success[-1]),
-                "max_rm_reward": float(rm_reward[slot].max()),
+                "max_rm_reward": float(rm_reward[slot, :length].max()),
             }
             save_episode(
                 out,
                 record,
-                frames=frames[slot],
-                actions=actions[slot],
-                rm_reward=rm_reward[slot],
+                frames=frames[slot, : length + 1],
+                actions=actions[slot, :length],
+                rm_reward=rm_reward[slot, :length],
                 step_success=step_success,
             )
             results.append(record)
@@ -314,7 +367,8 @@ def main() -> None:
         ckpt=os.path.abspath(args.ckpt) if args.ckpt else None,
         model_cfg=os.path.abspath(args.model_cfg),
         reruns=args.reruns,
-        anchor_step=anchor,
+        anchor_step=args.anchor_step,
+        anchors=os.path.abspath(args.anchors) if args.anchors else None,
         success_threshold=args.success_threshold,
     )
     logger.info(

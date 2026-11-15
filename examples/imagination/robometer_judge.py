@@ -90,10 +90,21 @@ def main() -> None:
     rollouts = Path(args.rollouts)
     paths = sorted((rollouts / "episodes").glob("*.npz"))
     logger.info(f"Judging {len(paths)} episodes in {rollouts}")
+    # A Robometer query batches episodes of one length only; imagined episodes from
+    # failure anchors are shorter than the others.
+    by_length = defaultdict(list)
+    for path in paths:
+        with np.load(path) as episode:
+            by_length[len(episode["actions"])].append(path)
+    batches = [
+        group[start : start + args.batch_size]
+        for _, group in sorted(by_length.items())
+        for start in range(0, len(group), args.batch_size)
+    ]
     rows = []
-    for start in range(0, len(paths), args.batch_size):
+    for batch_paths in batches:
         batch, samples = [], []
-        for path in paths[start : start + args.batch_size]:
+        for path in batch_paths:
             with np.load(path) as episode:
                 num_frames = len(episode["frames"])
                 if (num_frames - 1) % args.stride != 0:
@@ -128,6 +139,7 @@ def main() -> None:
             rows.append(row)
         logger.info(f"{len(rows)}/{len(paths)} episodes judged")
 
+    rows.sort(key=lambda row: row["episode"])
     with open(rollouts / "robometer_judge.jsonl", "w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
