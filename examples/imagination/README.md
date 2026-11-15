@@ -68,6 +68,7 @@ WM fine-tuning runs in the external [RLinf/opensora](https://github.com/RLinf/op
 | `collect_rollouts.py` | Rolls a policy out in LIBERO and saves every episode | `.venv` |
 | `select_anchors.py` | Picks imagination start points shortly before real failures (see [Failure anchors](#failure-anchors)) | `.venv` |
 | `anchor_scores.py` | The failure scores `select_anchors.py --method` chooses from | — |
+| `compare_anchors.py` | Compares the anchors of several `select_anchors.py` outputs (separation AUROC, alarms per task) | `.venv` |
 | `imagine_rollouts.py` | Rolls a policy out in the WM (closed loop), or replays real actions in it (open loop) | OpenSora venv |
 | `robometer_judge.py` | Labels real or imagined episodes as successes with Robometer | Robometer venv |
 | `export_imagined.py` | Writes judged successes (or every rollout, `--all`) as a LeRobot dataset | `.venv` |
