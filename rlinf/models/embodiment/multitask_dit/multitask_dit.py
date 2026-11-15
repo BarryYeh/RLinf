@@ -248,11 +248,16 @@ class MultitaskDiTPolicy(nn.Module, BasePolicy):
         images: torch.Tensor,
         tasks: list[str],
         generator: Optional[torch.Generator] = None,
+        num_samples: int = 1,
     ) -> torch.Tensor:
-        """Denoise a full ``horizon`` of raw actions from frames and instructions."""
-        cond = self._encode_obs(images, tasks)
+        """Denoise full ``horizon``s of raw actions from frames and instructions.
+
+        Returns ``[B * num_samples, horizon, action_dim]``; the ``num_samples``
+        draws for one input are adjacent, and the observation is encoded once.
+        """
+        cond = self._encode_obs(images, tasks).repeat_interleave(num_samples, dim=0)
         sample = torch.randn(
-            (images.shape[0], self.cfg.horizon, self.cfg.action_dim),
+            (cond.shape[0], self.cfg.horizon, self.cfg.action_dim),
             generator=generator,
             device=cond.device,
         )

@@ -2001,6 +2001,24 @@ def test_multitask_dit_predicts_chunks_within_the_action_bounds(monkeypatch):
     assert result["forward_inputs"]["action"] is actions
 
 
+def test_multitask_dit_draws_several_samples_per_observation_like_repeated_inputs(
+    monkeypatch,
+):
+    policy = _tiny_multitask_dit(monkeypatch).eval()
+    images = torch.randint(0, 256, (2, 2, 40, 40, 3), dtype=torch.uint8)
+    tasks = ["pick up the bowl", "open the drawer"]
+    drawn = policy.sample_actions(
+        images, tasks, torch.Generator().manual_seed(0), num_samples=3
+    )
+    repeated = policy.sample_actions(
+        images.repeat_interleave(3, dim=0),
+        [task for task in tasks for _ in range(3)],
+        torch.Generator().manual_seed(0),
+    )
+    assert drawn.shape == (6, 8, 7)
+    torch.testing.assert_close(drawn, repeated)
+
+
 def test_multitask_dit_rejects_a_crop_the_vision_encoder_cannot_take(monkeypatch):
     with pytest.raises(ValueError, match="input size"):
         _tiny_multitask_dit(monkeypatch, crop_shape=[24, 24])

@@ -16,6 +16,7 @@
 # One run of the imagination SFT protocol (README "Protocol"), resumable.
 #
 #   real     the base policy on the imagination states, K reruns
+#   anchors  with ANCHOR_METHOD set, start points shortly before each real failure
 #   imagine  N closed-loop rollouts per state in the world model, PARTS in parallel
 #   judge    Robometer success calls on the imagined rollouts
 #   export   per task, the top KEEP judged successes per state, cut at success
@@ -44,6 +45,8 @@ K=${K:-4}
 N=${N:-8}
 KEEP=${KEEP:-4}
 ANCHOR_STEP=${ANCHOR_STEP:-0}
+ANCHOR_METHOD=${ANCHOR_METHOD:-}  # failure-anchor score (select_anchors.py --method), empty = ANCHOR_STEP
+ANCHOR_ARGS=${ANCHOR_ARGS:-}      # more select_anchors.py options, e.g. "--ace-samples 32"
 SEED=${SEED:-0}
 PARTS=${PARTS:-4}
 TRIALS=${TRIALS:-}            # imagination trials per task, empty = all
@@ -60,6 +63,8 @@ export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=$REPO
 CACHE_DIR=${CACHE_DIR:-$DS/cache/multitask_dit}
 SETTINGS=(BASE_CKPT MODEL_CFG WM_CKPT STATES DEMOS DEMOS_PER_TASK VAL_REAL K N KEEP
   ANCHOR_STEP SEED PARTS TRIALS TEST_TRIALS TEST_RERUNS SFT_STEPS MONITOR BASE_EVAL)
+# Recorded only when set, so run dirs from before the setting still resume.
+[ -z "$ANCHOR_METHOD" ] || SETTINGS+=(ANCHOR_METHOD ANCHOR_ARGS)
 
 IMAGINATION=$REPO/examples/imagination
 PY=$MAIN_VENV/bin/python
@@ -116,8 +121,17 @@ real() {
     --reruns "$K" ${TRIALS:+--trials "$TRIALS"}
 }
 
+select_anchors() {
+  local extra
+  read -ra extra <<< "$ANCHOR_ARGS"
+  $PY "$IMAGINATION/select_anchors.py" --method "$ANCHOR_METHOD" --real "$RUN/real" \
+    --ckpt "$BASE_CKPT" --model-cfg "$MODEL_CFG" --out "$RUN/anchors.json" \
+    --seed "$SEED" "${extra[@]}" > "$RUN/anchors.log" 2>&1
+}
+
 imagine() {
-  local trials p pids=()
+  local trials p pids=() start=(--anchor-step "$ANCHOR_STEP")
+  [ -n "$ANCHOR_METHOD" ] && start=(--anchors "$RUN/anchors.json")
   # The real run's trial ids, split into PARTS contiguous ranges of near-equal size.
   read -ra trials <<< "$($PY -c "
 import sys; sys.path.insert(0, '$IMAGINATION')
@@ -136,7 +150,7 @@ for p in range(parts):
     "$OPENSORA_VENV/bin/python" "$IMAGINATION/imagine_rollouts.py" --mode policy \
       --real "$RUN/real" --wm-ckpt "$WM_CKPT" --ckpt "$BASE_CKPT" --model-cfg "$MODEL_CFG" \
       --out "$RUN/imagined/part_$p" --trials "${trials[$p]}" --reruns "$N" \
-      --anchor-step "$ANCHOR_STEP" --num-envs 10 --seed $((SEED + p)) --no-fused-kernels \
+      "${start[@]}" --num-envs 10 --seed $((SEED + p)) --no-fused-kernels \
       > "$RUN/imagined/part_$p.log" 2>&1 &
     pids+=($!)
   done
@@ -219,6 +233,7 @@ report() {
 }
 
 stage real real
+[ -n "$ANCHOR_METHOD" ] && stage anchors select_anchors
 stage imagine imagine
 stage judge judge "$RUN/imagined/all"
 stage export export_kept

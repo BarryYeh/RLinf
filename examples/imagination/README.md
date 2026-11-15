@@ -66,6 +66,8 @@ WM fine-tuning runs in the external [RLinf/opensora](https://github.com/RLinf/op
 | `run_protocol.sh` | Runs the whole protocol (see [Protocol](#protocol)) | — |
 | `sample_init_states.py` | Samples and splits new initial states (see [Initial states](#initial-states)) | `.venv` |
 | `collect_rollouts.py` | Rolls a policy out in LIBERO and saves every episode | `.venv` |
+| `select_anchors.py` | Picks imagination start points shortly before real failures (see [Failure anchors](#failure-anchors)) | `.venv` |
+| `anchor_scores.py` | The failure scores `select_anchors.py --method` chooses from | — |
 | `imagine_rollouts.py` | Rolls a policy out in the WM (closed loop), or replays real actions in it (open loop) | OpenSora venv |
 | `robometer_judge.py` | Labels real or imagined episodes as successes with Robometer | Robometer venv |
 | `export_imagined.py` | Writes judged successes (or every rollout, `--all`) as a LeRobot dataset | `.venv` |
@@ -107,6 +109,7 @@ bash examples/imagination/run_protocol.sh ~/datastorage/runs/imagination/protoco
 | Stage | Does | Settings | Time |
 |---|---|---|---|
 | `real` | Base policy in LIBERO on the imagination states | 4 reruns per state (1,200 episodes) | ~2 h |
+| `anchors` | Only with `ANCHOR_METHOD` set: [failure anchors](#failure-anchors) from the real run | `ace`, 90th percentile, 2 chunks, 16-step lead | — |
 | `imagine` | Base policy closed loop in the WM from each state's real reset frame | 8 rollouts per state (2,400 episodes), 4 parallel parts | ~18 h |
 | `judge` | Robometer success calls on the imagined rollouts | threshold 0.5, 3 frames in a row, stride 8 | ~1 h |
 | `export` | One dataset per task: per state, the top 4 judged successes, cut at `success_step` | — | minutes |
@@ -115,7 +118,7 @@ bash examples/imagination/run_protocol.sh ~/datastorage/runs/imagination/protoco
 | `monitor` | Open-loop disagreement on the validation run, judged on both sides | — | ~3 h |
 | `report` | `report.md` in the format of [Reporting results](#reporting-results), plus kept data and disagreement per task | — | minutes |
 
-Settings are environment variables with the defaults above (`K`, `N`, `KEEP`, `ANCHOR_STEP`, `SEED`, checkpoints, and paths; see the script header).
+Settings are environment variables with the defaults above (`K`, `N`, `KEEP`, `ANCHOR_STEP`, `ANCHOR_METHOD`, `ANCHOR_ARGS`, `SEED`, checkpoints, and paths; see the script header).
 A rerun with the same run directory skips finished stages (`<stage>.done`) and refuses changed settings.
 `BASE_EVAL` reuses a finished test evaluation of the base policy instead of rerunning it.
 
@@ -151,6 +154,38 @@ python examples/imagination/label_advantages.py --datasets <truncated>/task_* --
 
 `label_advantages.py` writes `meta/advantages_<tag>.parquet` and `.json` (settings and per-task baseline, threshold, and counts) into each dataset, so a different cut never rewrites the data.
 
+### Failure anchors
+
+Imagination from the reset frame spends most of its WM budget on the part of the episode the policy already handles.
+Failure anchors start it instead from a real frame shortly before a real episode starts to fail, so the imagined rollouts try recoveries.
+The simulator already says which real episodes failed; the anchor only has to say when.
+
+1. **Score.** A failure score rates each chunk boundary (every 8 steps) of every real episode from the frame history and instruction the policy saw there; `--method` picks it (see the table below).
+2. **Threshold.** Per task and chunk, the 90th percentile of the score over the task's successful episodes before their first success, pooled over 2 chunks on each side (the time-varying threshold of FAIL-Detect and SAFE, without conformal calibration).
+   No score trains on the run it scores, so every success calibrates.
+3. **Anchor.** A failed episode's alarm is the end of its first run of 2 chunks above the threshold; its anchor is 16 steps earlier, at most step 160.
+   Without an alarm, it is 16 steps before the episode's largest excess over the threshold.
+4. **Imagine.** Each state's start points are its failed episodes at their anchors, or its reset frame when no rerun failed.
+   Imagined rerun \(k\) starts from point \(k\) modulo their number and runs to step 240 of the real episode.
+   Judge, export and SFT are unchanged.
+
+| `--method` | Score | Options |
+|---|---|---|
+| `ace` | FIPER's action-chunk entropy: the policy draws 32 chunks over its 32-step horizon; at each horizon step, the Shannon entropy of their end-effector paths (cumulative xyz deltas) on a grid whose cells are 3% of each axis's range over the successes; the mean over steps | `--ace-samples`, `--ace-cell-size` |
+
+Steps 2–4 live in `select_anchors.py` and are the same for every score.
+`anchor_scores.py` holds step 1: `RealRun` reads a real run at its chunk boundaries, and each score subclasses `AnchorScore` (its options, `settings()`, and `score()`, which returns one value per boundary) and joins `SCORES`.
+The scores follow the reference code of [FIPER](https://github.com/learnsyslab/fiper) (`13d79c5`); clone it, and [uq_vla](https://github.com/learnsyslab/uq_vla) (`bcc2433`) for VFD, into `third_party/` to compare (not tracked).
+
+```bash
+python examples/imagination/select_anchors.py --method ace --real <run>/real --ckpt <policy> --out <run>/anchors.json
+python examples/imagination/imagine_rollouts.py --mode policy --real <run>/real --anchors <run>/anchors.json ...
+```
+
+`anchors.json` holds the method and settings, the thresholds, `sources` (each state's start points), and per episode its scores, alarm, and anchor.
+The scores are cached in `<method>.npz` beside it and reused while the checkpoint, seed, method settings and episodes match.
+In the protocol, `ANCHOR_METHOD` picks the method and `ANCHOR_ARGS` passes more options.
+
 ### Measuring WM dynamics error
 
 Replay each step-1 real rollout's actions in the WM from the same initial frame (open loop, `imagine_rollouts.py --mode replay`), and score the real and replayed frames with the same judge (Robometer, as in selection); `wm_fidelity.py --replay` computes the rates below.
@@ -185,7 +220,7 @@ Ask the project owner before changing any of these.
 - **Filtering.** An absolute success floor, then within-group top-k: 8 imagined rollouts per state, keeping the 4 judged successes with the highest mean score.
   Never rank alone, because the best of an all-failure group is still a failure.
   The floor is Robometer alone, with the judge settings of [targeted imagination](experiments/targeted.md), not recalibrated.
-- **Start step.** Imagination starts from the real reset frame (`--anchor-step 0`).
+- **Start step.** Imagination starts from the real reset frame (`--anchor-step 0`) by default; [failure anchors](#failure-anchors) (`ANCHOR_METHOD=ace`) are an opt-in arm.
 - **Training frames.** The policy trains on imagined frames and has no real-frame replay arm.
 - **Fine-tuning.** Only the WM is fine-tuned, on real rollouts. Robometer is used off the shelf.
 
