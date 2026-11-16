@@ -66,9 +66,9 @@ WM fine-tuning runs in the external [RLinf/opensora](https://github.com/RLinf/op
 | `run_protocol.sh` | Runs the whole protocol (see [Protocol](#protocol)) | — |
 | `sample_init_states.py` | Samples and splits new initial states (see [Initial states](#initial-states)) | `.venv` |
 | `collect_rollouts.py` | Rolls a policy out in LIBERO and saves every episode | `.venv` |
-| `select_anchors.py` | Picks imagination start points shortly before real failures (see [Failure anchors](#failure-anchors)) | `.venv` |
-| `anchor_scores.py` | The failure scores `select_anchors.py --method` chooses from | — |
-| `compare_anchors.py` | Compares the anchors of several `select_anchors.py` outputs (separation AUROC, alarms per task) | `.venv` |
+| `anchor/select.py` | Picks imagination start points shortly before real failures (see [Failure anchors](#failure-anchors)) | `.venv` |
+| `anchor/score.py` | The failure scores `anchor/select.py --method` chooses from | — |
+| `anchor/compare_anchors.py` | Compares the anchors of several `anchor/select.py` outputs (separation AUROC, alarms per task) | `.venv` |
 | `imagine_rollouts.py` | Rolls a policy out in the WM (closed loop), or replays real actions in it (open loop) | OpenSora venv |
 | `robometer_judge.py` | Labels real or imagined episodes as successes with Robometer | Robometer venv |
 | `export_imagined.py` | Writes judged successes (or every rollout, `--all`) as a LeRobot dataset | `.venv` |
@@ -175,14 +175,17 @@ The simulator already says which real episodes failed; the anchor only has to sa
 | `ace` | FIPER's action-chunk entropy: the policy draws 32 chunks over its 32-step horizon; at each horizon step, the Shannon entropy of their end-effector paths (cumulative xyz deltas) on a grid whose cells are 3% of each axis's range over the successes; the mean over steps | `--ace-samples`, `--ace-cell-size` |
 | `rnd_oe` | FIPER's RND-OE: random network distillation on the policy's observation embedding (`encode_obs`, 2304-d). The predictor trains on every frame of the LIBERO-Spatial demos (`--rnd-demos`, all 432); the successes of `--rnd-val-run` (other initial states) pick the best epoch and stop training; the score is the predictor's error | `--rnd-demos`, `--rnd-val-run`, `--rnd-cache-dir`, `--rnd-task-suite`, `--rnd-epochs`, `--rnd-patience` |
 
-Steps 2–4 live in `select_anchors.py` and are the same for every score.
-`anchor_scores.py` holds step 1: `RealRun` reads a real run at its chunk boundaries, and each score subclasses `AnchorScore` (its options, `settings()`, and `score()`, which returns one value per boundary) and joins `SCORES`.
+The code lives in `anchor/`. Steps 2–4 live in `select.py` and are the same for every score.
+`score.py` holds step 1: `RealRun` reads a real run at its chunk boundaries, and each score subclasses `AnchorScore` (its options, `settings()`, and `score()`, which returns one value per boundary) and joins `SCORES`.
 The scores follow the reference code of [FIPER](https://github.com/learnsyslab/fiper) (`13d79c5`); clone it, and [uq_vla](https://github.com/learnsyslab/uq_vla) (`bcc2433`) for VFD, into `third_party/` to compare (not tracked).
 
+Run the `anchor/` modules from the repository root with `python -m`; run as a file, `select.py` would shadow Python's `select` module.
+
 ```bash
-python examples/imagination/select_anchors.py --method ace --real <run>/real --ckpt <policy> --out <run>/anchors.json
-python examples/imagination/select_anchors.py --method rnd_oe --real <run>/real --ckpt <policy> --out <run>/anchors.json \
+python -m examples.imagination.anchor.select --method ace --real <run>/real --ckpt <policy> --out <run>/anchors.json
+python -m examples.imagination.anchor.select --method rnd_oe --real <run>/real --ckpt <policy> --out <run>/anchors.json \
   --rnd-demos <libero> --rnd-val-run <validation real run> --rnd-cache-dir <frame cache>
+python -m examples.imagination.anchor.compare_anchors <run_a>/anchors.json <run_b>/anchors.json
 python examples/imagination/imagine_rollouts.py --mode policy --real <run>/real --anchors <run>/anchors.json ...
 ```
 

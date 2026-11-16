@@ -15,7 +15,7 @@
 """Pick where imagined rollouts start: shortly before a real episode starts to fail.
 
 ``--real`` is a finished ``collect_rollouts.py`` run of the policy ``--ckpt``.
-``--method`` (see ``anchor_scores.py``) scores every chunk boundary of every episode;
+``--method`` (see ``score.py``) scores every chunk boundary of every episode;
 the scores are cached in ``<method>.npz`` beside ``--out``.
 
 A task's threshold at chunk ``c`` is the ``--quantile`` of the score over the task's
@@ -39,15 +39,16 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-from anchor_scores import SCORES, AnchorScore, RealRun
-from common import episode_name
 from omegaconf import OmegaConf
 
 from rlinf.utils.logging import get_logger
 
+from ..common import episode_name
+from .score import SCORES, AnchorScore, RealRun
+
 logger = get_logger()
 
-REPO_PATH = Path(__file__).resolve().parents[2]
+REPO_PATH = Path(__file__).resolve().parents[3]
 DEFAULT_MODEL_CFG = REPO_PATH / "examples/embodiment/config/model/multitask_dit.yaml"
 RECORD_FIELDS = ("state_id", "task_id", "rerun", "success", "first_success_step")
 

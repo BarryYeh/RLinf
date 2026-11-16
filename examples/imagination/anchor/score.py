@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Failure scores of real episodes, the methods ``select_anchors.py --method`` picks.
+"""Failure scores of real episodes, the methods ``select.py --method`` picks.
 
 A score rates every chunk boundary of every episode of a ``collect_rollouts.py`` run
 from what the policy saw there: its frame history and the instruction. Higher means
@@ -29,10 +29,11 @@ from typing import ClassVar, Iterator
 
 import numpy as np
 import torch
-from common import episode_name, load_policy, load_records
 from torch import nn
 
 from rlinf.utils.logging import get_logger
+
+from ..common import episode_name, load_policy, load_records
 
 logger = get_logger()
 
@@ -97,7 +98,7 @@ class RealRun:
 class AnchorScore(ABC):
     """A failure score. Subclasses set ``name`` and implement the methods below.
 
-    ``args`` is the ``select_anchors.py`` namespace: the shared ``ckpt``,
+    ``args`` is the ``select.py`` namespace: the shared ``ckpt``,
     ``model_cfg``, ``batch_size`` and ``seed``, plus the score's own options.
     """
 

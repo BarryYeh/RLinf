@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare the failure anchors of several ``select_anchors.py`` outputs.
+"""Compare the failure anchors of several ``select.py`` outputs.
 
 For each ``anchors.json`` (labeled by its method, or by ``--labels``), prints as
 Markdown:

@@ -21,7 +21,7 @@ frame, written to ``<out>/init_frames/`` in its trajectory format; the condition
 window repeats it with the env's reset condition actions, at any anchor.
 
 ``--mode policy`` runs the policy closed loop in the world model, ``--reruns`` times
-per state, from the state's rerun 0. With ``--anchors`` (a ``select_anchors.py``
+per state, from the state's rerun 0. With ``--anchors`` (an ``anchor/select.py``
 output) each state instead has a list of start points, each a real rerun and its own
 anchor step, and imagined rerun ``k`` starts from point ``k`` modulo their number.
 ``--mode replay`` feeds each real episode's actions from the anchor on to the world
@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--anchors",
         default=None,
-        help="select_anchors.py output with per-state start points (policy mode); "
+        help="anchor/select.py output with per-state start points (policy mode); "
         "replaces --anchor-step.",
     )
     parser.add_argument("--num-envs", type=int, default=32)
