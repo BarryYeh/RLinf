@@ -14,12 +14,13 @@
 
 """Compare the failure anchors of several ``select.py`` outputs.
 
-For each ``anchors.json`` (labeled by its method, or by ``--labels``), prints as
+For each ``anchors.json`` (labeled by its methods, or by ``--labels``), prints as
 Markdown:
 
-- separation: the AUROC of an episode's largest excess of the score over the
-  threshold within its first ``H`` steps, failures against successes that have not
-  succeeded by step ``H`` (both still trying), for several ``H``;
+- separation: the AUROC of an episode's largest ratio of score to threshold (1 is at
+  threshold for every method) within its first ``H`` steps, failures against
+  successes that have not succeeded by step ``H`` (both still trying), for several
+  ``H``;
 - alarms: failures alarmed, successes alarmed before their first success, and the
   anchor steps of failures, overall and per task.
 """
@@ -45,21 +46,21 @@ def auroc(positive: np.ndarray, negative: np.ndarray) -> float:
 class Anchors:
     def __init__(self, path: Path, label: str | None):
         data = json.loads(path.read_text())
-        self.label = label or data["method"]
+        combine = f" {data['settings']['combine']} "
+        self.label = label or combine.join(data["methods"])
         rows = data["episodes"]
         self.rows = rows
         self.chunk = data["chunk"]
-        self.scores = np.array([r["scores"] for r in rows])
-        self.tau = np.array([data["thresholds"][str(r["task_id"])] for r in rows])
+        self.ratio = np.array([r["ratio"] for r in rows])
         self.success = np.array([r["success"] for r in rows])
         self.first_success = np.array([r["first_success_step"] for r in rows])
         self.task = np.array([r["task_id"] for r in rows])
 
     def separation(self, steps: int) -> str:
         chunks = steps // self.chunk
-        excess = (self.scores[:, :chunks] - self.tau[:, :chunks]).max(axis=1)
+        peak = self.ratio[:, :chunks].max(axis=1)
         trying = self.success & (self.first_success > steps)
-        value = auroc(excess[~self.success], excess[trying])
+        value = auroc(peak[~self.success], peak[trying])
         return f"{value:.3f} ({trying.sum()})"
 
     def alarms(self, mask: np.ndarray) -> str:

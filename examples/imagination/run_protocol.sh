@@ -45,7 +45,7 @@ K=${K:-4}
 N=${N:-8}
 KEEP=${KEEP:-4}
 ANCHOR_STEP=${ANCHOR_STEP:-0}
-ANCHOR_METHOD=${ANCHOR_METHOD:-}  # failure-anchor score (anchor/select.py --method), empty = ANCHOR_STEP
+ANCHOR_METHOD=${ANCHOR_METHOD:-}  # failure-anchor scores (anchor/select.py --method), e.g. "ace rnd_oe"; empty = ANCHOR_STEP
 ANCHOR_ARGS=${ANCHOR_ARGS:-}      # more anchor/select.py options, e.g. "--ace-samples 32"
 SEED=${SEED:-0}
 PARTS=${PARTS:-4}
@@ -122,9 +122,10 @@ real() {
 }
 
 select_anchors() {
-  local extra
+  local methods extra
+  read -ra methods <<< "$ANCHOR_METHOD"
   read -ra extra <<< "$ANCHOR_ARGS"
-  $PY -m examples.imagination.anchor.select --method "$ANCHOR_METHOD" --real "$RUN/real" \
+  $PY -m examples.imagination.anchor.select --method "${methods[@]}" --real "$RUN/real" \
     --ckpt "$BASE_CKPT" --model-cfg "$MODEL_CFG" --out "$RUN/anchors.json" \
     --rnd-demos "$DEMOS" --rnd-val-run "$VAL_REAL" --rnd-cache-dir "$CACHE_DIR" \
     --seed "$SEED" "${extra[@]}" > "$RUN/anchors.log" 2>&1

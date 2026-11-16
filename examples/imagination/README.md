@@ -110,7 +110,7 @@ bash examples/imagination/run_protocol.sh ~/datastorage/runs/imagination/protoco
 | Stage | Does | Settings | Time |
 |---|---|---|---|
 | `real` | Base policy in LIBERO on the imagination states | 4 reruns per state (1,200 episodes) | ~2 h |
-| `anchors` | Only with `ANCHOR_METHOD` set: [failure anchors](#failure-anchors) from the real run | `ace` or `rnd_oe`, 90th percentile, 2 chunks, 16-step lead | — |
+| `anchors` | Only with `ANCHOR_METHOD` set: [failure anchors](#failure-anchors) from the real run | `rnd_oe` recommended; 6-chunk sums, per-step threshold at the 90th percentile, first crossing, 16-step lead | — |
 | `imagine` | Base policy closed loop in the WM from each state's real reset frame | 8 rollouts per state (2,400 episodes), 4 parallel parts | ~18 h |
 | `judge` | Robometer success calls on the imagined rollouts | threshold 0.5, 3 frames in a row, stride 8 | ~1 h |
 | `export` | One dataset per task: per state, the top 4 judged successes, cut at `success_step` | — | minutes |
@@ -162,11 +162,14 @@ Failure anchors start it instead from a real frame shortly before a real episode
 The simulator already says which real episodes failed; the anchor only has to say when.
 
 1. **Score.** A failure score rates each chunk boundary (every 8 steps) of every real episode from the frame history and instruction the policy saw there; `--method` picks it (see the table below).
-2. **Threshold.** Per task and chunk, the 90th percentile of the score over the task's successful episodes before their first success, pooled over 2 chunks on each side (the time-varying threshold of FAIL-Detect and SAFE, without conformal calibration).
+2. **Aggregate.** As in FIPER, each chunk's score becomes its sum over the last `--agg-window` chunks, so one high chunk weighs less than a run of them.
+3. **Threshold.** The `--quantile` of the sums over the task's successful episodes before their first success: per chunk, pooled over `--pool` chunks on each side (`--threshold step`, the time-varying threshold of FIPER, FAIL-Detect and SAFE), or one value per task from each success's largest sum (`max`, FIPER's constant threshold).
+   A task with fewer than `--min-calibration` values pools every task, and chunks past the last one with that many keep its threshold.
    No score trains on the run it scores, so every success calibrates.
-3. **Anchor.** A failed episode's alarm is the end of its first run of 2 chunks above the threshold; its anchor is 16 steps earlier, at most step 160.
-   Without an alarm, it is 16 steps before the episode's largest excess over the threshold.
-4. **Imagine.** Each state's start points are its failed episodes at their anchors, or its reset frame when no rerun failed.
+4. **Alarm.** A method's ratio is its sum over its threshold, so 1 is at threshold for every method; with several methods, `--combine and` (FIPER's detector) takes the smallest ratio and `or` the largest.
+   A failed episode's alarm is the first chunk where the ratio exceeds 1.
+5. **Anchor.** `--lead` steps before the alarm, at most step `--max-anchor`; without an alarm, `--lead` steps before the episode's largest ratio.
+6. **Imagine.** Each state's start points are its failed episodes at their anchors, or its reset frame when no rerun failed.
    Imagined rerun \(k\) starts from point \(k\) modulo their number and runs to step 240 of the real episode.
    Judge, export and SFT are unchanged.
 
@@ -175,7 +178,24 @@ The simulator already says which real episodes failed; the anchor only has to sa
 | `ace` | FIPER's action-chunk entropy: the policy draws 32 chunks over its 32-step horizon; at each horizon step, the Shannon entropy of their end-effector paths (cumulative xyz deltas) on a grid whose cells are 1% of each axis's range over the successes (FIPER uses 3%, which left most scores at exactly 0 here); the mean over steps. The sampled paths are kept in `ace_paths.npz`, so another cell size rescores in seconds | `--ace-samples`, `--ace-cell-size`, `--ace-paths` |
 | `rnd_oe` | FIPER's RND-OE: random network distillation on the policy's observation embedding (`encode_obs`, 2304-d). The predictor trains on every frame of the LIBERO-Spatial demos (`--rnd-demos`, all 432); the successes of `--rnd-val-run` (other initial states) pick the best epoch and stop training; the score is the predictor's error | `--rnd-demos`, `--rnd-val-run`, `--rnd-cache-dir`, `--rnd-task-suite`, `--rnd-epochs`, `--rnd-patience` |
 
-The code lives in `anchor/`. Steps 2–4 live in `select.py` and are the same for every score.
+| Option | Default | Raising it |
+|---|---|---|
+| `--agg-window` | 6 | Fewer alarms from single-chunk blips; alarms come up to (w − 1) · 8 steps later |
+| `--threshold` | `step` | `max` uses one value per task, from each success's peak: fewer alarms on successes, but later anchors, since it ignores the phase of the episode |
+| `--quantile` | 0.9 | Fewer alarms on failures and successes alike |
+| `--combine` | `and` | `or` alarms whenever any method does |
+| `--lead`, `--max-anchor` | 16, 160 | Moves anchors earlier, or caps them; alarms don't change |
+
+The threshold defaults to `step`, the per-step threshold behind FIPER's best result, because anchors only come from failed episodes: an alarm on a success places no anchor, and `step` alarms earlier.
+On the broad run's 1,200 episodes, RND-OE with the defaults alarms 220 of 288 failures, with a median anchor at step 72; the other 68 anchor before their largest ratio.
+It also alarms 264 of 912 successes before they succeed, and separates failures from successes still trying at step 96 with an AUROC of 0.683.
+A sweep of 96 settings (ACE at 1% and 3% cells, RND-OE, and their `and`/`or`, over the window, threshold style and quantile) favors `--threshold max` when alarms on successes count against a setting.
+Among settings that alarm at most 15% of successes early, alarm at least 80% of failures, and pin at most 25% of anchors at step 160, `max` separates best (AUROC 0.713): it alarms all 288 failures and 96 successes, with a median anchor at step 104.
+Held out (calibrating on half the states and reporting on the other half, 5 random splits per task, both ways), `max` alarms 99% of failures and 12% of successes early, with AUROC 0.71 (0.63–0.80).
+ACE alone reaches an AUROC of at most 0.66.
+Unlike FIPER, the settings are not picked on test results, and its conformal-band threshold is left out.
+
+The code lives in `anchor/`. Steps 2–6 live in `select.py` and are the same for every score.
 `score.py` holds step 1: `RealRun` reads a real run at its chunk boundaries, and each score subclasses `AnchorScore` (its options, `settings()`, and `score()`, which returns one value per boundary) and joins `SCORES`.
 The scores follow the reference code of [FIPER](https://github.com/learnsyslab/fiper) (`13d79c5`); clone it, and [uq_vla](https://github.com/learnsyslab/uq_vla) (`bcc2433`) for VFD, into `third_party/` to compare (not tracked).
 
@@ -185,13 +205,15 @@ Run the `anchor/` modules from the repository root with `python -m`; run as a fi
 python -m examples.imagination.anchor.select --method ace --real <run>/real --ckpt <policy> --out <run>/anchors.json
 python -m examples.imagination.anchor.select --method rnd_oe --real <run>/real --ckpt <policy> --out <run>/anchors.json \
   --rnd-demos <libero> --rnd-val-run <validation real run> --rnd-cache-dir <frame cache>
+python -m examples.imagination.anchor.select --method ace rnd_oe --combine and --real <run>/real --ckpt <policy> \
+  --out <run>/anchors_and.json --cache-dir <run> ...   # reuses <run>/ace.npz and <run>/rnd_oe.npz
 python -m examples.imagination.anchor.compare_anchors <run_a>/anchors.json <run_b>/anchors.json
 python examples/imagination/imagine_rollouts.py --mode policy --real <run>/real --anchors <run>/anchors.json ...
 ```
 
-`anchors.json` holds the method and settings, the thresholds, `sources` (each state's start points), and per episode its scores, alarm, and anchor.
-The scores are cached in `<method>.npz` beside it and reused while the checkpoint, seed, method settings and episodes match.
-In the protocol, `ANCHOR_METHOD` picks the method, `ANCHOR_ARGS` passes more options, and RND-OE uses `DEMOS` and `VAL_REAL`.
+`anchors.json` holds the methods and settings, the thresholds per method, `sources` (each state's start points), and per episode its raw scores, ratio, alarm, and anchor.
+The scores are cached in `<method>.npz` in `--cache-dir` (default: beside `--out`) and reused while the checkpoint, seed, method settings and episodes match.
+In the protocol, `ANCHOR_METHOD` lists the methods, `ANCHOR_ARGS` passes more options, and RND-OE uses `DEMOS` and `VAL_REAL`.
 
 ### Measuring WM dynamics error
 
