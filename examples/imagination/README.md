@@ -172,7 +172,7 @@ The simulator already says which real episodes failed; the anchor only has to sa
 
 | `--method` | Score | Options |
 |---|---|---|
-| `ace` | FIPER's action-chunk entropy: the policy draws 32 chunks over its 32-step horizon; at each horizon step, the Shannon entropy of their end-effector paths (cumulative xyz deltas) on a grid whose cells are 3% of each axis's range over the successes; the mean over steps | `--ace-samples`, `--ace-cell-size` |
+| `ace` | FIPER's action-chunk entropy: the policy draws 32 chunks over its 32-step horizon; at each horizon step, the Shannon entropy of their end-effector paths (cumulative xyz deltas) on a grid whose cells are 1% of each axis's range over the successes (FIPER uses 3%, which left most scores at exactly 0 here); the mean over steps. The sampled paths are kept in `ace_paths.npz`, so another cell size rescores in seconds | `--ace-samples`, `--ace-cell-size`, `--ace-paths` |
 | `rnd_oe` | FIPER's RND-OE: random network distillation on the policy's observation embedding (`encode_obs`, 2304-d). The predictor trains on every frame of the LIBERO-Spatial demos (`--rnd-demos`, all 432); the successes of `--rnd-val-run` (other initial states) pick the best epoch and stop training; the score is the predictor's error | `--rnd-demos`, `--rnd-val-run`, `--rnd-cache-dir`, `--rnd-task-suite`, `--rnd-epochs`, `--rnd-patience` |
 
 The code lives in `anchor/`. Steps 2–4 live in `select.py` and are the same for every score.

@@ -22,6 +22,7 @@ subclasses ``AnchorScore`` and is added there.
 
 import argparse
 import copy
+import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -150,7 +151,13 @@ class ActionChunkEntropy(AnchorScore):
     the offset. At each horizon step the samples fall into cells of
     ``--ace-cell-size`` times each dimension's range over the successful episodes'
     pre-success boundaries (a zero range takes the largest), and the score is the
-    mean over steps of the entropy of the cell counts.
+    mean over steps of the entropy of the cell counts. The default cell is smaller
+    than FIPER's 0.03 because the range spans the whole horizon, so 0.03 cells hold
+    almost every boundary's samples in one cell.
+
+    The sampled paths are kept in ``--ace-paths`` (default ``ace_paths.npz`` beside
+    ``--out``) and reused while the checkpoint, seed, samples, batch size and
+    episodes match, so another cell size rescores without sampling.
     """
 
     name = "ace"
@@ -163,15 +170,20 @@ class ActionChunkEntropy(AnchorScore):
         group.add_argument(
             "--ace-cell-size",
             type=float,
-            default=0.03,
+            default=0.01,
             help="Histogram cell size as a fraction of each dimension's range.",
+        )
+        group.add_argument(
+            "--ace-paths",
+            default=None,
+            help="Sampled-path cache (.npz); default: ace_paths.npz beside --out.",
         )
 
     def settings(self) -> dict:
         return {"samples": self.args.ace_samples, "cell_size": self.args.ace_cell_size}
 
     def score(self, run: RealRun) -> np.ndarray:
-        paths = self._sample_paths(run)  # [E, C, H, S, 3]
+        paths = self._paths(run)  # [E, C, H, S, 3]
         calibration = np.concatenate(
             [
                 paths[i, : run.pre_success_chunks(r)].reshape(-1, 3)
@@ -185,6 +197,32 @@ class ActionChunkEntropy(AnchorScore):
         return np.stack(
             [histogram_entropy(episode, cell).mean(axis=-1) for episode in paths]
         )
+
+    def _paths(self, run: RealRun) -> np.ndarray:
+        """The sampled paths, from ``--ace-paths`` or sampled and saved there."""
+        args = self.args
+        cache = Path(args.ace_paths or Path(args.out).parent / "ace_paths.npz")
+        meta = {
+            "ckpt": os.path.abspath(args.ckpt),
+            "seed": args.seed,
+            "samples": args.ace_samples,
+            "batch_size": args.batch_size,
+        }
+        if cache.exists():
+            with np.load(cache) as cached:
+                found = json.loads(str(cached["meta"]))
+                if found != meta or list(cached["names"]) != run.names:
+                    raise ValueError(
+                        f"Expected {cache} sampled with {meta} on the episodes of "
+                        f"{run.path}, found {found}; delete it to resample."
+                    )
+                logger.info(f"ace: loaded sampled paths from {cache}")
+                return cached["paths"]
+        paths = self._sample_paths(run)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache, paths=paths, names=np.array(run.names), meta=json.dumps(meta))
+        logger.info(f"ace: wrote sampled paths to {cache}")
+        return paths
 
     def _sample_paths(self, run: RealRun) -> np.ndarray:
         """``[episodes, num_chunks, horizon, samples, 3]`` xyz paths from each boundary."""
